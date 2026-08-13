@@ -380,6 +380,65 @@ def _degenerate_reason(text: str) -> str:
     return ""
 
 
+# --- Tool calls arriving as the final answer --------------------------------
+#
+# Both router models do this, so it is not a mistral quirk: gemini-flash returned
+# '[{"tool_call_id": "6", "tool_name": "grep_files", "parameters": {...}}]' as a per-file answer
+# in a real map_reduce, and mistral-large returns 'grep_files{"query": ...}' with the tool's
+# output pasted after it. Every existing check passes such an answer - it is long, non-empty,
+# non-repetitive, and can even contain a real citation.
+#
+# Two shapes, both unambiguous: an answer that PARSES as a tool-call payload, and one that opens
+# with an identifier glued to a JSON object. Prose does not do either.
+_TOOL_CALL_PREFIX_RE = re.compile(r"^\s*(?:```[a-zA-Z0-9_-]*\s*\n?)?([a-z][a-z0-9_]{2,30})\s*[\{\(]\s*[\"']")
+
+
+def _looks_like_one_tool_call(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if "tool_call_id" in value:
+        return True
+    name = value.get("tool_name") or value.get("name")
+    return bool(name) and any(k in value for k in ("parameters", "arguments", "args"))
+
+
+def _tool_call_answer_reason(text: str) -> str:
+    prefix = _TOOL_CALL_PREFIX_RE.match(text or "")
+    if prefix:
+        return (
+            f"the answer starts with a raw {prefix.group(1)!r} tool call instead of an answer; "
+            "call the tool, read its result, then reply with the ANSWER in prose"
+        )
+    body = _strip_code_fence(text or "").strip()
+    if not body or body[0] not in "[{":
+        return ""
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return ""
+    items = parsed if isinstance(parsed, list) else [parsed]
+    # `all` alone would accept an empty list; a legitimate JSON answer (require_json) is not
+    # rejected because it carries none of the tool-call keys.
+    if items and all(_looks_like_one_tool_call(item) for item in items):
+        return (
+            "the answer is a raw tool-call payload, not an answer; call the tool, read its "
+            "result, then reply with the ANSWER"
+        )
+    return ""
+
+
+def _unusable_answer_reason(text: str) -> str:
+    """Answers that are not answers at all, checked before any validator.
+
+    Separate from validation on purpose: these are generation failures, not a model that
+    answered the wrong thing, and they are worth catching even when the caller asked for no
+    acceptance criteria whatsoever.
+    """
+    if os.environ.get("HARNESS_ALLOW_DEGENERATE"):
+        return ""
+    return _degenerate_reason(text) or _tool_call_answer_reason(text)
+
+
 def build_validator(
     *,
     min_length: int = 0,
@@ -850,9 +909,9 @@ def _run_subagent_task(
         # Runs even with no validator, and before one: a degenerate answer is a failed
         # generation, not a candidate to be judged, and handing one to a judge_model pays for a
         # second model call to be told what a regex already knew.
-        degenerate = _degenerate_reason(final_text)
-        if degenerate:
-            accepted, reason = False, degenerate
+        unusable = _unusable_answer_reason(final_text)
+        if unusable:
+            accepted, reason = False, unusable
         else:
             accepted, reason = (True, "ok") if validator is None else validator(final_text)
         history.append({"attempt": attempt, "model": model, "ok": True, "accepted": accepted, "reason": reason})

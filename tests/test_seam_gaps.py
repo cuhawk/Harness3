@@ -327,6 +327,28 @@ class DegenerateAnswerTests(unittest.TestCase):
         finally:
             del _os.environ["HARNESS_ALLOW_DEGENERATE"]
 
+    def test_gemini_flash_tool_call_payload_is_rejected(self):
+        # Verbatim from a real map_reduce per-file answer, 2026-08-13.
+        blob = ('[\n    {"tool_call_id": "6", "tool_name": "grep_files", "parameters": '
+                '{"regex": true, "query": "hasPermission|role", "glob_pattern": "app/x.js"}}\n]')
+        self.assertIn("tool-call payload", subagent._unusable_answer_reason(blob))
+
+    def test_mistral_tool_call_prefix_is_rejected(self):
+        blob = 'grep_files{"query": "def clean_version", "glob_pattern": "scm_pipeline.py"}```{...}```'
+        self.assertIn("raw", subagent._unusable_answer_reason(blob))
+
+    def test_a_legitimate_json_answer_is_not_rejected(self):
+        self.assertEqual(subagent._unusable_answer_reason('{"total": 5, "files": ["a.js"]}'), "")
+        self.assertEqual(subagent._unusable_answer_reason('[{"path": "a.js", "hits": 2}]'), "")
+
+    def test_prose_naming_a_tool_is_not_rejected(self):
+        self.assertEqual(
+            subagent._unusable_answer_reason("I used grep_files to search, and found 3 hits."), "")
+        self.assertEqual(subagent._unusable_answer_reason("NONE"), "")
+
+    def test_empty_json_list_is_not_a_tool_call(self):
+        self.assertEqual(subagent._unusable_answer_reason("[]"), "")
+
     def test_degenerate_answer_retries_even_with_no_validator(self):
         rt = _FakeRuntime("m", ["answer" + "```}" * 100, "the real answer"])
         result = subagent._run_subagent_task("do it", "m", max_attempts=2, runtime_factory=lambda m: rt)
