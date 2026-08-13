@@ -129,6 +129,58 @@ class TaskShapeTests(LedgerTestCase):
         self.assertEqual(ledger.task_shape(task).split("|")[1], "+".join(groups))
 
 
+class RetryChurnIsVisibleTests(LedgerTestCase):
+    """The motivating bug: a pilot where 7 of 8 runs needed two attempts reported an EMPTY
+    top_rejection_reasons, because the aggregation read delegations.rejection_reason (blank on
+    any run that eventually succeeded) instead of the per-attempt table. Retry churn on
+    otherwise-green runs is precisely what the ledger exists to surface."""
+
+    def _record_retry_then_success(self, task, model, first_reason):
+        ledger.record_delegation(
+            task=task, model=model, ok=True, accepted=True, attempts=2, latency_ms=78890,
+            rejection_reason="", status="complete", validator_kinds=["require_regex"],
+            entry_point="spawn_map_reduce",
+            validation_history=[
+                {"attempt": 1, "model": model, "ok": True, "accepted": False, "reason": first_reason},
+                {"attempt": 2, "model": model, "ok": True, "accepted": True, "reason": "ok"},
+            ],
+        )
+
+    def _stats(self, **kwargs):
+        return json.loads(ledger.delegation_stats.invoke(kwargs))
+
+    def test_reasons_survive_a_run_that_was_accepted_on_retry(self):
+        task = "Run the two patterns over the chunk and report the counts."
+        for _ in range(3):
+            self._record_retry_then_success(task, "gemini-flash", "the answer was empty; produce the requested output")
+        bucket = self._stats()["stats"][0]
+        self.assertEqual(bucket["ok_rate"], 1.0)          # green by every run-level measure...
+        self.assertEqual(bucket["retry_rate"], 1.0)       # ...yet every run needed a second attempt
+        self.assertEqual(bucket["top_rejection_reasons"], [
+            {"reason": "the answer was empty; produce the requested output", "count": 3},
+        ])
+
+    def test_retry_rate_ignores_single_attempt_runs(self):
+        task = "Run the two patterns over the chunk and report the counts."
+        self._record_retry_then_success(task, "nemotron", "the answer was empty; produce the requested output")
+        ledger.record_delegation(
+            task=task, model="nemotron", ok=True, accepted=True, attempts=1, latency_ms=1000,
+            rejection_reason="", status="complete", validator_kinds=["require_regex"],
+            entry_point="spawn_map_reduce",
+            validation_history=[{"attempt": 1, "model": "nemotron", "ok": True, "accepted": True, "reason": "ok"}],
+        )
+        bucket = self._stats()["stats"][0]
+        self.assertEqual(bucket["retry_rate"], 0.5)
+        self.assertEqual(bucket["attempt_distribution"], {"1": 1, "2": 1})
+
+    def test_a_model_filter_does_not_leak_another_models_attempts(self):
+        task = "Run the two patterns over the chunk and report the counts."
+        self._record_retry_then_success(task, "gemini-flash", "the answer was empty; produce the requested output")
+        self._record_retry_then_success(task, "mistral-large", "citation does not resolve")
+        bucket = self._stats(model="mistral-large")["stats"][0]
+        self.assertEqual([r["reason"] for r in bucket["top_rejection_reasons"]], ["citation does not resolve"])
+
+
 class RecordAndStatsTests(LedgerTestCase):
     def _record(self, task, model, ok, attempts, latency, status="complete", reason=""):
         ledger.record_delegation(

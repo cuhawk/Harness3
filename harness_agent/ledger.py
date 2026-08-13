@@ -309,20 +309,22 @@ def delegation_stats(
     try:
         where: list[str] = []
         args: list[Any] = []
+        # The "{d}" is a table-alias slot: the same conditions are reused in a join against
+        # delegation_attempts, where every one of these column names is ambiguous.
         if (task_shape or "").strip():
-            where.append("task_shape LIKE ?")
+            where.append("{d}task_shape LIKE ?")
             args.append(f"%{task_shape.strip()}%")
         if (model or "").strip():
-            where.append("model = ?")
+            where.append("{d}model = ?")
             args.append(model.strip())
         if int(since_days or 0) > 0:
             cutoff = time.strftime(
                 "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - int(since_days) * 86400)
             )
             # ts is stored in "%Y-%m-%d %H:%M:%S" local time, which sorts lexicographically.
-            where.append("ts >= ?")
+            where.append("{d}ts >= ?")
             args.append(cutoff)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        clause = (" WHERE " + " AND ".join(where)).format(d="") if where else ""
 
         min_runs = max(1, int(min_runs or 1))
         max_rows = max(1, min(int(max_rows or 50), 500))
@@ -340,7 +342,9 @@ def delegation_stats(
             # Per-bucket detail is fetched row by row rather than aggregated in SQL: the attempt
             # distribution and the median both need the individual values, and SQLite has no
             # median. max_rows bounds how many of these run.
-            group_clause = " WHERE " + " AND ".join(where + ["task_shape = ?", "model = ?"])
+            group_conds = where + ["{d}task_shape = ?", "{d}model = ?"]
+            group_clause = (" WHERE " + " AND ".join(group_conds)).format(d="")
+            attempt_clause = (" WHERE " + " AND ".join(group_conds)).format(d="d.")
             stats = []
             for g in group_rows[:max_rows]:
                 detail = conn.execute(
@@ -356,15 +360,26 @@ def delegation_stats(
                     attempt_dist[str(r["attempts"])] = attempt_dist.get(str(r["attempts"]), 0) + 1
                     st = r["status"] or "unknown"
                     status_counts[st] = status_counts.get(st, 0) + 1
-                    if not r["ok"] and r["rejection_reason"]:
-                        key = r["rejection_reason"][:160]
-                        reasons[key] = reasons.get(key, 0) + 1
+                # Rejection reasons come from the ATTEMPT table, not from the run's final
+                # rejection_reason. A run that was rejected twice and accepted on the third
+                # attempt has ok=1 and an empty rejection_reason, so aggregating over runs
+                # reports "no rejections" for exactly the retry-churn case worth measuring.
+                for a in conn.execute(
+                    "SELECT a.reason AS reason, COUNT(*) AS n FROM delegation_attempts a"
+                    f" JOIN delegations d ON d.id = a.delegation_id{attempt_clause}"
+                    " AND a.accepted = 0 AND a.reason != ''"
+                    " GROUP BY a.reason ORDER BY n DESC, a.reason LIMIT 3",
+                    args + [g["task_shape"], g["model"]],
+                ).fetchall():
+                    reasons[str(a["reason"])[:160]] = int(a["n"])
+                retried = sum(1 for r in detail if int(r["attempts"] or 0) > 1)
                 stats.append({
                     "task_shape": g["task_shape"],
                     "model": g["model"],
                     "runs": runs,
                     "ok_rate": round(sum(1 for r in detail if r["ok"]) / runs, 3) if runs else 0.0,
                     "accepted_rate": round(sum(1 for r in detail if r["accepted"]) / runs, 3) if runs else 0.0,
+                    "retry_rate": round(retried / runs, 3) if runs else 0.0,
                     "attempt_distribution": dict(sorted(attempt_dist.items())),
                     "median_latency_ms": _median([int(r["latency_ms"] or 0) for r in detail]),
                     "status_counts": status_counts,
