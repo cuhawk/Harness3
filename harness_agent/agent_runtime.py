@@ -211,8 +211,12 @@ def list_proxy_models() -> list[str]:
 # =============================================================================
 
 class AgentRuntime:
-    def __init__(self, model_name: str, session_id: str | None = None):
+    def __init__(self, model_name: str, session_id: str | None = None, pin_tools_to_task: bool = False):
         self.model_name = model_name
+        # Delegated runs set this: score tool selection off the ORIGINAL task plus the latest
+        # turn, not the latest turn alone. See tools_registry.select_tools_for_messages.
+        # Left False for interactive sessions, where following the newest message is correct.
+        self.pin_tools_to_task = pin_tools_to_task
         # Set by sessions.SessionManager.create_runtime for every runtime it owns - threaded
         # into the render_thinking/render_tool_use calls below so a background tab's turn
         # always writes into ITS OWN scrollback, not whichever tab the user happens to be
@@ -258,7 +262,9 @@ class AgentRuntime:
             if self._tool_selection_cache is not None and self._tool_selection_cache[0] == last_human_idx:
                 selected_tools = self._tool_selection_cache[1]
             else:
-                selected_tools = tools_registry.select_tools_for_messages(messages)
+                selected_tools = tools_registry.select_tools_for_messages(
+                    messages, pin_to_first=self.pin_tools_to_task
+                )
                 self._tool_selection_cache = (last_human_idx, selected_tools)
             llm_with_tools = self._llm_for_tools(selected_tools)
             # .stream() + chunk accumulation, not .invoke(): LangGraph's stream_mode=

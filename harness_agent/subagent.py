@@ -290,7 +290,7 @@ def _run_subagent_task(
         from .agent_runtime import AgentRuntime
 
         def runtime_factory(m: str) -> Any:  # type: ignore[misc]
-            rt = AgentRuntime(m)
+            rt = AgentRuntime(m, pin_tools_to_task=True)
             # Restoring inside the FACTORY (rather than seeding a runtime before the loop) is
             # what makes resume compose with the existing retry logic untouched: the loop's
             # "runtime is None -> send the task fresh" rule still holds, and an attempt that

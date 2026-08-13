@@ -411,12 +411,35 @@ def select_tools(prompt: str = "", profile: str | None = None) -> list[BaseTool]
     return _dedupe_tools(*selected)
 
 
-def select_tools_for_messages(messages: list[Any], profile: str | None = None) -> list[BaseTool]:
-    """Select tools from the most recent human message in a LangChain message list."""
-    prompt = ""
-    for message in reversed(messages):
+def _human_texts(messages: list[Any]) -> list[str]:
+    out = []
+    for message in messages:
         message_type = getattr(message, "type", "")
         if message_type == "human" or message.__class__.__name__ == "HumanMessage":
-            prompt = str(getattr(message, "content", "") or "")
-            break
+            out.append(str(getattr(message, "content", "") or ""))
+    return out
+
+
+def select_tools_for_messages(
+    messages: list[Any], profile: str | None = None, pin_to_first: bool = False
+) -> list[BaseTool]:
+    """Select tools from a LangChain message list.
+
+    By default this scores off the most recent human message, which is right for an
+    interactive session: the user changes topic and the tool set follows.
+
+    ``pin_to_first`` is for a DELEGATED run, where the first human message is the task
+    and every later one is machinery - a retry's rejection-feedback string, or a resume's
+    follow-up. Scoring those alone silently drops the task's own tools mid-run (a browser
+    task retried with "your previous answer was too short" scores nothing browser-ish and
+    comes back with no browser tools bound). Scoring the task and the latest turn together
+    keeps the task's tools while still reacting to what the new turn asks for.
+    """
+    humans = _human_texts(messages)
+    if not humans:
+        prompt = ""
+    elif pin_to_first and len(humans) > 1:
+        prompt = humans[0] + "\n\n" + humans[-1]
+    else:
+        prompt = humans[-1]
     return select_tools(prompt, profile=profile)
