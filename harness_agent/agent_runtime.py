@@ -16,6 +16,7 @@ Differences from the original:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Callable
 
 import requests
@@ -253,11 +254,23 @@ class AgentRuntime:
         self.graph = self._build_graph(model_name)
 
     def _build_llm(self, model_name: str, tools: list[BaseTool]):
+        # temperature 0 is the obvious choice for tool work and may be the wrong one. Greedy
+        # decoding takes the argmax token every time, so when a rare identifier has a common
+        # near-neighbour (tsg_id vs tsk_id, i.e. task id) a model that narrowly prefers the
+        # common one emits it CONSISTENTLY for that context - which is the shape of the
+        # silent-zero bug. Every path that gets this right (Claude Code over the same router,
+        # a direct API call) sends no temperature at all. HARNESS_TEMPERATURE makes that
+        # testable without editing code; unset keeps the current behaviour.
+        raw = (os.environ.get("HARNESS_TEMPERATURE") or "").strip()
+        try:
+            temperature = float(raw) if raw else 0.0
+        except ValueError:
+            temperature = 0.0
         llm = ChatOpenAI(
             model=model_name,
             base_url=core.LITELLM_BASE_URL,
             api_key=core.LITELLM_API_KEY,
-            temperature=0,
+            temperature=temperature,
             timeout=120,
             max_retries=2,
         )
