@@ -41,6 +41,26 @@ from . import sessions
 Validator = Callable[[str], "tuple[bool, str]"]
 
 
+def _fanout_workers(task_count: int) -> int:
+    """How many sub-agents to run concurrently in a fan-out.
+
+    The default is CPU-derived, which is the wrong shape for this workload: a sub-agent
+    thread spends nearly all of its life blocked on an HTTP call to the router, so the
+    ceiling that matters is the router's key pool, not this box's cores. ``HARNESS_MAP_WORKERS``
+    exists so the pool can be raised past ``cpu_count`` (or pinned low while measuring where
+    provider 429s actually start) without editing code. Unset/invalid keeps the old behaviour.
+    """
+    override = (os.environ.get("HARNESS_MAP_WORKERS") or "").strip()
+    if override:
+        try:
+            configured = int(override)
+        except ValueError:
+            configured = 0
+        if configured > 0:
+            return max(1, min(task_count, configured))
+    return max(1, min(task_count, max(1, (os.cpu_count() or 1) - 2)))
+
+
 # =============================================================================
 # Result validation (the "200 but bad/incomplete data" check)
 # =============================================================================
@@ -1354,7 +1374,7 @@ def spawn_map_reduce(
 
         core.SUBAGENT_DEPTH += 1
         try:
-            worker_count = min(len(selected), max(1, (os.cpu_count() or 1) - 2))
+            worker_count = _fanout_workers(len(selected))
             with ThreadPoolExecutor(max_workers=worker_count) as pool:
                 futures = [
                     pool.submit(
@@ -1549,7 +1569,7 @@ def spawn_subagents_parallel(
 
         core.SUBAGENT_DEPTH += 1
         try:
-            worker_count = min(len(tasks), max(1, (os.cpu_count() or 1) - 2))
+            worker_count = _fanout_workers(len(tasks))
             with ThreadPoolExecutor(max_workers=worker_count) as pool:
                 # Each task gets its own validator (the judge closure captures that task's text).
                 futures = [
