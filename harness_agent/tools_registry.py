@@ -391,11 +391,14 @@ def _requested_profile(profile: str | None) -> str:
 
 # Core sub-groups, pinnable by name. CORE_TOOLS is 38 tools on its own - already past the
 # size where models start corrupting tool ARGUMENTS rather than picking the wrong tool - so a
-# pin able only to subtract specialist groups would not fix the thing it exists for. Measured
-# on nemotron at temperature 0, same prompt, pooled over three probe runs: bound the 86 this
-# scorer picks for a one-tool prompt it emits query='tsk_id' 7/7, which greps to zero matches
-# and is then reported as a confident, complete "0"; bound 1 tool, or this module's own
-# ["filesystem"] pin (16 tools), it emits 'tsg_id' 7/7. A system prompt changes neither.
+# pin able only to subtract specialist groups would not fix the thing it exists for. Measured on
+# nemotron-Ultra at temperature 0, through the real agent loop: bound the 86 this scorer picks
+# for a one-tool prompt, it typo'd query='tsk_id' on every call and scored 0.44 on a 9-file
+# instrument; bound this module's ["filesystem"] pin (16 tools), 0.67 with the typo still on
+# 7 of 11 calls. So a smaller binding measurably helps and does NOT cure it - the driver is
+# total context load, of which tool schemas are one part. A typo'd query greps to zero matches
+# and is then reported as a confident, complete "0", so pin what you can and do not send
+# mechanical extraction to a model at all.
 _CORE_SUBGROUPS: dict[str, list[BaseTool]] = {
     "core": CORE_TOOLS,
     "filesystem": FILESYSTEM_TOOLS,
