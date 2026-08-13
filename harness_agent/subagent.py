@@ -269,6 +269,113 @@ def _verify_citation(path: str, line: int, cache: dict[str, Any]) -> tuple[str, 
     return f"points past the end of the file ({longest} lines)", str(targets[0])
 
 
+# --- Quoted-snippet verification -------------------------------------------
+#
+# Verifying that a citation POINTS somewhere real is a much weaker guarantee than it sounds:
+# "scm_pipeline.py:12" passes as long as the file has twelve lines. Caught live on 2026-08-13 -
+# a model fabricated a whole grep_files result, cited line 12 for a function that is actually at
+# line 1812, and the answer was accepted, because the reference resolved.
+#
+# A quote is a claim of verbatim text, so it can be checked against the file. Only backticked
+# text counts (prose paraphrase is not a claim), and a miss is a rejection ONLY when the text
+# appears in none of the files the answer cited - a snippet attached to the nearest citation but
+# quoted from another of them must not fail the answer.
+_QUOTED_RE = re.compile(r"`{1,3}([^`\n]{8,200})`{1,3}")
+_SNIPPET_WINDOW = 200
+_ELLIPSES = ("...", "…")
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _quoted_near(body: str, raw: str) -> str:
+    """The backticked fragment adjacent to citation ``raw``, or "" if there is none worth checking."""
+    idx = body.find(raw)
+    if idx < 0:
+        return ""
+    window = body[max(0, idx - _SNIPPET_WINDOW): idx + len(raw) + _SNIPPET_WINDOW]
+    for match in _QUOTED_RE.finditer(window):
+        snippet = match.group(1).strip()
+        if any(e in snippet for e in _ELLIPSES):
+            continue  # an elided quote is not a verbatim claim
+        if _CITATION_RE.search(snippet):
+            continue  # the quoted thing is the citation itself, not code from the file
+        if len(snippet) >= 8:
+            return snippet
+    return ""
+
+
+def _file_text(rp: Path, cache: dict[str, Any]) -> str:
+    texts: dict[str, str] = cache.setdefault("texts", {})
+    key = str(rp)
+    if key not in texts:
+        try:
+            if rp.stat().st_size > _MAX_CITATION_FILE_BYTES:
+                texts[key] = ""  # too big to scan: fail open, same as the line-count check
+            else:
+                texts[key] = _normalize_for_match(
+                    rp.read_bytes().decode("utf-8", errors="replace")
+                )
+        except Exception:
+            texts[key] = ""
+    return texts[key]
+
+
+def _snippet_problem(identity: str, snippet: str, cache: dict[str, Any]) -> str:
+    """"" if the quote is real (or unverifiable), else a fragment naming the fabrication."""
+    needle = _normalize_for_match(snippet)
+    if not needle:
+        return ""
+    seen: list[str] = cache.setdefault("verified_paths", [])
+    for key in [identity] + [p for p in seen if p != identity]:
+        haystack = _file_text(Path(key), cache)
+        if not haystack:
+            return ""  # unreadable or oversized somewhere in the chain: do not reject on it
+        if needle in haystack:
+            return ""
+    return f"the quoted text {core.trim_text(snippet, 80)!r} does not appear in that file"
+
+
+# --- Degenerate output ------------------------------------------------------
+#
+# Runaway repetition is a generation failure, not an answer: mistral-large emits corrupted
+# tool-call syntax as its final answer roughly one run in three, and it arrives as a fragment
+# repeated until the token budget runs out. Nothing else in the chain catches it - the text is
+# long, contains the required substrings, and can even carry a valid citation.
+#
+# Checked on the TAIL only, because that is what a stuck decoder produces, and a bounded window
+# keeps this O(window x unit) with no backtracking. A run of one repeated character is exempt:
+# "-----" and "=====" are how a model draws a rule, not how it breaks.
+_DEGENERATE_WINDOW = 8000
+_DEGENERATE_MAX_UNIT = 40
+_DEGENERATE_MIN_REPEATS = 20
+
+
+def _degenerate_reason(text: str) -> str:
+    if os.environ.get("HARNESS_ALLOW_DEGENERATE"):
+        return ""
+    tail = (text or "")[-_DEGENERATE_WINDOW:]
+    n = len(tail)
+    for unit in range(2, _DEGENERATE_MAX_UNIT + 1):
+        if n < unit * _DEGENERATE_MIN_REPEATS:
+            continue
+        block = tail[-unit:]
+        if len(set(block.strip())) < 2:
+            continue
+        repeats = 1
+        i = n - unit
+        while i - unit >= 0 and tail[i - unit:i] == block:
+            repeats += 1
+            i -= unit
+        if repeats >= _DEGENERATE_MIN_REPEATS:
+            return (
+                f"the answer degenerates into {block!r} repeated {repeats} times; it was not "
+                "finished - return the complete answer as prose, with no repeated fragment"
+            )
+    return ""
+
+
 def build_validator(
     *,
     min_length: int = 0,
@@ -324,6 +431,7 @@ def build_validator(
             # basename index, so a 30-citation answer walks the workspace no more than once.
             cache: dict[str, Any] = {}
             verified: set[tuple[str, int]] = set()
+            quoted: list[tuple[str, str]] = []
             for raw, path, line in _citation_candidates(body):
                 checked = _verify_citation(path, line, cache)
                 if checked is None:
@@ -337,6 +445,22 @@ def build_validator(
                         f"actually read, as path:line"
                     )
                 verified.add((identity, line))
+                cache.setdefault("verified_paths", []).append(identity)
+                quoted.append((raw, identity))
+            # Second pass, deliberately: a snippet is only a fabrication if it appears in NONE of
+            # the cited files, and the last citation in the answer is as eligible a source as the
+            # nearest one. Checking inline would reject a quote whose file is cited a sentence
+            # later - which is how "compare `x` with a.py:1 and b.py:2" is normally written.
+            for raw, identity in quoted:
+                snippet = _quoted_near(body, raw)
+                if not snippet:
+                    continue
+                snippet_problem = _snippet_problem(identity, snippet, cache)
+                if snippet_problem:
+                    return False, (
+                        f"the citation {raw!r} is wrong: {snippet_problem}; quote only text "
+                        "you actually read, at the line where it really appears"
+                    )
             if len(verified) < citation_min:
                 return False, (
                     f"the answer has {len(verified)} verified file citation(s), need >= "
@@ -719,7 +843,14 @@ def _run_subagent_task(
             runtime = None  # rebuild fresh next attempt
             continue
 
-        accepted, reason = (True, "ok") if validator is None else validator(final_text)
+        # Runs even with no validator, and before one: a degenerate answer is a failed
+        # generation, not a candidate to be judged, and handing one to a judge_model pays for a
+        # second model call to be told what a regex already knew.
+        degenerate = _degenerate_reason(final_text)
+        if degenerate:
+            accepted, reason = False, degenerate
+        else:
+            accepted, reason = (True, "ok") if validator is None else validator(final_text)
         history.append({"attempt": attempt, "model": model, "ok": True, "accepted": accepted, "reason": reason})
         if accepted:
             saved_id, save_error = _persist_session(runtime, session_id, session_name, model)

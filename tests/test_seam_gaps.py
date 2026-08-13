@@ -220,5 +220,104 @@ class AbsolutePosixCitationTests(_CitationTestCase):
         self.assertAccepted("Fetched https://example.com:8080/lib/app.js:12, see src/app.py:12.")
 
 
+class SnippetVerificationTests(unittest.TestCase):
+    """A resolving citation is not a true one. Regression for the live 2026-08-13 failure: a
+    model fabricated a grep_files result, cited line 12 for a function that is at line 1812, and
+    the answer was accepted because the file does have twelve lines."""
+
+    def setUp(self):
+        import tempfile
+        self._previous_workspace = str(core.WORKSPACE)
+        self._tmp = tempfile.TemporaryDirectory()
+        core.set_workspace(self._tmp.name)
+        self.ws = core.WORKSPACE
+        body = ["import os", ""] + [f"# filler {i}" for i in range(3, 40)]
+        body.append("def clean_version(version_name: str) -> None:")
+        body.append("    return None")
+        (self.ws / "pipeline.py").write_text("\n".join(body), encoding="utf-8")
+        (self.ws / "other.py").write_text("def helper(argument_name):\n    pass\n", encoding="utf-8")
+        self.validate = subagent.build_validator(require_citations=True)
+
+    def tearDown(self):
+        core.set_workspace(self._previous_workspace)
+        self._tmp.cleanup()
+
+    def test_fabricated_quote_is_rejected(self):
+        ok, reason = self.validate(
+            "It is defined as `def clean_version(version):` at pipeline.py:12."
+        )
+        self.assertFalse(ok, "a quote that appears nowhere in the file was accepted")
+        self.assertIn("does not appear", reason)
+
+    def test_real_quote_at_a_real_line_is_accepted(self):
+        ok, reason = self.validate(
+            "It is `def clean_version(version_name: str) -> None:` at pipeline.py:40."
+        )
+        self.assertTrue(ok, reason)
+
+    def test_quote_from_another_cited_file_does_not_false_reject(self):
+        # The snippet sits next to pipeline.py's citation but was quoted from other.py.
+        ok, reason = self.validate(
+            "Compare `def helper(argument_name):` with pipeline.py:40 and other.py:1."
+        )
+        self.assertTrue(ok, reason)
+
+    def test_elided_quote_is_not_a_verbatim_claim(self):
+        ok, reason = self.validate("It is `def clean_version(...)` at pipeline.py:40.")
+        self.assertTrue(ok, reason)
+
+    def test_short_quote_is_ignored(self):
+        ok, reason = self.validate("The `os` import is at pipeline.py:1.")
+        self.assertTrue(ok, reason)
+
+    def test_unquoted_prose_is_not_checked(self):
+        # Paraphrase is not a claim of verbatim text, so it must not be verified against the file.
+        ok, reason = self.validate("It defines clean_version taking a version at pipeline.py:40.")
+        self.assertTrue(ok, reason)
+
+    def test_line_check_still_applies(self):
+        ok, reason = self.validate("See `def clean_version(version_name: str) -> None:` at pipeline.py:9000.")
+        self.assertFalse(ok)
+        self.assertIn("points past the end", reason)
+
+
+class DegenerateAnswerTests(unittest.TestCase):
+    def test_runaway_repetition_is_caught(self):
+        reason = subagent._degenerate_reason("Here is the answer" + "```}" * 100)
+        self.assertIn("degenerates", reason)
+        self.assertIn("repeated", reason)
+
+    def test_normal_answer_is_clean(self):
+        self.assertEqual(subagent._degenerate_reason("A perfectly ordinary sentence."), "")
+        self.assertEqual(subagent._degenerate_reason(""), "")
+
+    def test_a_rule_of_repeated_characters_is_not_degenerate(self):
+        # "-----" and "=====" are how a model draws a separator, not how it breaks.
+        self.assertEqual(subagent._degenerate_reason("Summary\n" + "-" * 200), "")
+        self.assertEqual(subagent._degenerate_reason("Summary\n" + "=" * 200), "")
+
+    def test_repetition_in_the_middle_does_not_fire(self):
+        # Only a stuck decoder is being caught, and it runs to the end of the output.
+        text = "start" + "ab" * 100 + "\n\nand here is the real conclusion, at length."
+        self.assertEqual(subagent._degenerate_reason(text), "")
+
+    def test_env_escape_hatch(self):
+        import os as _os
+        _os.environ["HARNESS_ALLOW_DEGENERATE"] = "1"
+        try:
+            self.assertEqual(subagent._degenerate_reason("x" + "```}" * 100), "")
+        finally:
+            del _os.environ["HARNESS_ALLOW_DEGENERATE"]
+
+    def test_degenerate_answer_retries_even_with_no_validator(self):
+        rt = _FakeRuntime("m", ["answer" + "```}" * 100, "the real answer"])
+        result = subagent._run_subagent_task("do it", "m", max_attempts=2, runtime_factory=lambda m: rt)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["result"], "the real answer")
+        self.assertFalse(result["validation_history"][0]["accepted"])
+        self.assertIn("degenerates", result["validation_history"][0]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
