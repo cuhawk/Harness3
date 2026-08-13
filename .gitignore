@@ -1,0 +1,23 @@
+# --- third-party clone, not part of the harness (~3.5 GB / 85k files) ---
+Documents/
+
+# --- dependencies ---
+node_modules/
+.venv/
+venv/
+
+# --- python bytecode ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- harness runtime state (sessions, results, findings, dossiers, jobs) ---
+.agent_cache/
+
+# --- MCP / browser runtime droppings ---
+.playwright-mcp/
+playwright_mcp_instances.json
+
+# --- local machine config, not portable ---
+.codex/
+*.log

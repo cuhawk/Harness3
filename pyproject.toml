@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness-agent"
+version = "0.1.0"
+description = "Local agent harness: REPL/TUI, tool-calling runtime, MCP client and server, workflows and automations."
+requires-python = ">=3.12"
+dependencies = [
+    "langchain==1.3.11",
+    "langchain-core==1.4.8",
+    "langchain-openai==1.3.3",
+    "langchain-text-splitters==1.1.2",
+    "langgraph==1.2.6",
+    "textual==8.2.8",
+    "rich==15.0.0",
+    "requests==2.34.2",
+    "playwright==1.60.0",
+    "pydantic==2.13.4",
+]
+
+[project.optional-dependencies]
+rag = [
+    "pypdf==6.13.2",
+    "python-docx==1.2.0",
+]
+
+[project.scripts]
+harness = "harness_agent.cli:main"
+harness-mcp-server = "harness_agent.mcp_server:serve_stdio"
+
+[tool.setuptools]
+packages = ["harness_agent"]

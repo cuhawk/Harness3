@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "playwright-8931": {
+      "url": "http://localhost:8931/mcp"
+    },
+    "playwright-8932": {
+      "url": "http://localhost:8932/mcp"
+    }
+  }
+}
