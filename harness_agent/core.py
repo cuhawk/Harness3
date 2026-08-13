@@ -23,7 +23,7 @@ from typing import Any
 
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000/v1")
 LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-anything")
-DEFAULT_MODEL = os.environ.get("MODEL", "cerebras-glm-4.7")
+DEFAULT_MODEL = os.environ.get("MODEL", "mistral-large")
 
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://localhost:8080")
 
