@@ -392,9 +392,10 @@ def _requested_profile(profile: str | None) -> str:
 # Core sub-groups, pinnable by name. CORE_TOOLS is 38 tools on its own - already past the
 # size where models start corrupting tool ARGUMENTS rather than picking the wrong tool - so a
 # pin able only to subtract specialist groups would not fix the thing it exists for. Measured
-# on nemotron at temperature 0: bound 1 tool, it emits query='tsg_id' 3/3; bound the 86 this
-# scorer picks for the same one-tool prompt, it emits 'tsk_id' 5/5, which greps to zero
-# matches and is then reported as a confident, complete "0".
+# on nemotron at temperature 0, same prompt, pooled over three probe runs: bound the 86 this
+# scorer picks for a one-tool prompt it emits query='tsk_id' 7/7, which greps to zero matches
+# and is then reported as a confident, complete "0"; bound 1 tool, or this module's own
+# ["filesystem"] pin (16 tools), it emits 'tsg_id' 7/7. A system prompt changes neither.
 _CORE_SUBGROUPS: dict[str, list[BaseTool]] = {
     "core": CORE_TOOLS,
     "filesystem": FILESYSTEM_TOOLS,
@@ -504,8 +505,8 @@ def select_tools(
 
     ``groups`` pins the selection explicitly and skips scoring entirely - for a caller that
     already knows what the task needs, which is every programmatic fan-out. A pin REPLACES the
-    whole selection, core included: ``groups=["filesystem"]`` binds 14 tools, not CORE's 38
-    plus 14. That is the point - see ``_CORE_SUBGROUPS`` for the measurement.
+    whole selection, core included: ``groups=["filesystem"]`` binds 16 tools, not CORE's 38
+    plus 16. That is the point - see ``_CORE_SUBGROUPS`` for the measurement.
     """
     pinned = resolve_pinned_groups(groups)
     if pinned is not None:

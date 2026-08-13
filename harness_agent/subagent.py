@@ -1164,7 +1164,7 @@ def spawn_subagent(
     routinely binds ~86 of 113 tools, and a large bound set makes models corrupt tool ARGUMENTS
     (measured: a query argument silently typo'd, which then matched nothing and was reported as
     a clean zero). Name the groups whenever you know them. A pin replaces the whole selection
-    including the core set, so "filesystem" means 14 tools, not 52. Valid: core, filesystem,
+    including the core set, so "filesystem" means 16 tools, not 54. Valid: core, filesystem,
     terminal, memory, tasks, briefing, web, browser, graphql, rag, process, mcp, delegation,
     workflow, automation, policy, ssh, verify, extract, dossier. An unknown name is an error,
     never a silent fallback to scoring."""
