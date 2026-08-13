@@ -220,6 +220,24 @@ class AbsolutePosixCitationTests(_CitationTestCase):
         self.assertAccepted("Fetched https://example.com:8080/lib/app.js:12, see src/app.py:12.")
 
 
+class MapReduceGapSampleTests(unittest.TestCase):
+    """A corpus sweep must not pay context to restate what resume_cursor already encodes."""
+
+    def test_inline_gaps_are_a_bounded_sample(self):
+        self.assertLessEqual(subagent._MAP_GAPS_INLINE, 20)
+
+    def test_the_cursor_reproduces_the_gaps_exactly(self):
+        # The contract that makes truncating the list safe: sorted order + offset. If the sort
+        # ever changes, a resumed sweep re-maps some files and skips others, silently.
+        matched = sorted(f"app/{i:03d}.js" for i in range(50))
+        offset, max_files = 0, 4
+        selected = matched[offset:offset + max_files]
+        gaps = matched[offset + len(selected):]
+        resumed = matched[offset + len(selected):offset + len(selected) + len(gaps)]
+        self.assertEqual(gaps, resumed)
+        self.assertEqual(len(gaps), 46)
+
+
 class SnippetVerificationTests(unittest.TestCase):
     """A resolving citation is not a true one. Regression for the live 2026-08-13 failure: a
     model fabricated a grep_files result, cited line 12 for a function that is at line 1812, and

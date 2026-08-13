@@ -347,6 +347,10 @@ def _snippet_problem(identity: str, snippet: str, cache: dict[str, Any]) -> str:
 # Checked on the TAIL only, because that is what a stuck decoder produces, and a bounded window
 # keeps this O(window x unit) with no backtracking. A run of one repeated character is exempt:
 # "-----" and "=====" are how a model draws a rule, not how it breaks.
+# How many unexamined paths a map_reduce reply shows inline. Enough to see WHAT was missed
+# (which directory, which extension); the count and the cursor carry the rest.
+_MAP_GAPS_INLINE = 10
+
 _DEGENERATE_WINDOW = 8000
 _DEGENERATE_MAX_UNIT = 40
 _DEGENERATE_MIN_REPEATS = 20
@@ -1398,7 +1402,14 @@ def spawn_map_reduce(
             "files_skipped_over_cap": skipped,
             "map_failed": map_failed,
             **completeness.envelope(
-                True, map_signals, covered=len(selected), total=len(matched), gaps=gaps[:200],
+                True, map_signals, covered=len(selected), total=len(matched),
+                # A SAMPLE, not the list. The full set of unexamined files is not information the
+                # caller has to hold: gaps_total says how many, and resume_cursor says how to get
+                # them - re-globbing at that offset reproduces them exactly, in the same order.
+                # At the 200 this used to inline, one corpus sweep spent ~10k characters of the
+                # caller's context restating what a two-field cursor already encodes, which is
+                # the leak this whole tool exists to avoid.
+                gaps=gaps[:_MAP_GAPS_INLINE],
             ),
         }
         if gaps:
