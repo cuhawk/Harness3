@@ -19,6 +19,7 @@ from . import dossier
 from . import extract_tools
 from . import fs_tools
 from . import jobs
+from . import ledger
 from . import memory
 from . import rag
 from . import shell_git
@@ -101,6 +102,10 @@ DELEGATION_TOOLS: list[BaseTool] = [
     jobs.spawn_subagent_async, jobs.spawn_subagents_parallel_async,
     jobs.spawn_map_reduce_async,
     jobs.check_job, jobs.wait_for_jobs, jobs.list_jobs,
+    # The read side of the delegation outcome ledger. It belongs with the delegation tools
+    # because it answers a delegation question ("which model handles this shape of work"), and
+    # DELEGATION_TOOLS is already folded into ALL_TOOLS/TOOL_BY_NAME below.
+    ledger.delegation_stats,
 ]
 
 BRIEFING_TOOLS: list[BaseTool] = [
@@ -375,6 +380,52 @@ def _expand_group_dependencies(group_names: set[str]) -> set[str]:
     return expanded
 
 
+_FULL_PROFILES = {"full", "all"}
+_CORE_PROFILES = {"core", "lite", "lean"}
+_FULL_CATALOG_PHRASES = ("all tools", "full tool", "full tools", "entire tool catalog")
+
+
+def _requested_profile(profile: str | None) -> str:
+    return (profile or os.environ.get("HARNESS_TOOL_PROFILE") or "auto").strip().lower()
+
+
+def select_group_names(prompt: str = "", profile: str | None = None) -> list[str]:
+    """Score the specialist groups for one prompt and return the chosen names, SORTED.
+
+    Split out of ``select_tools``, which computed exactly this set and then threw the names
+    away. The outcome ledger fingerprints a delegation by the groups its run actually bound, so
+    it has to ask the real selector: a second, parallel scorer would drift from this one and
+    produce shape labels that no longer describe the runs they are attached to.
+
+    Sorted, not a set, because ``ledger.task_shape`` joins the names into a bucket key - set
+    iteration order would split one shape across several buckets.
+
+    The fixed profiles return ``[]``: they bind a whole catalog without scoring anything, so
+    there is no group selection to report.
+    """
+    requested = _requested_profile(profile)
+    if requested in _FULL_PROFILES or requested in _CORE_PROFILES:
+        return []
+
+    text = str(prompt or "").lower()
+    if _contains_any(text, _FULL_CATALOG_PHRASES):
+        return sorted(SPECIALIST_GROUPS)
+
+    prompt_tokens = _tokenize(text)
+    threshold = float(os.environ.get("HARNESS_TOOL_SCORE_THRESHOLD", "3.0"))
+    max_groups = max(1, int(os.environ.get("HARNESS_TOOL_MAX_GROUPS", "6")))
+    scored = [
+        (name, _score_group(group, text, prompt_tokens))
+        for name, group in SPECIALIST_GROUPS.items()
+    ]
+    selected_names = {
+        name
+        for name, score in sorted(scored, key=lambda item: item[1], reverse=True)[:max_groups]
+        if score >= threshold
+    }
+    return sorted(_expand_group_dependencies(selected_names))
+
+
 def select_tools(prompt: str = "", profile: str | None = None) -> list[BaseTool]:
     """Return the tool set to bind for one model call.
 
@@ -383,29 +434,17 @@ def select_tools(prompt: str = "", profile: str | None = None) -> list[BaseTool]
     - ``core``/``lite``/``lean``: filesystem, terminal/git, memory, and tasks.
     - ``full``/``all``: every tool, matching the original behavior.
     """
-    requested = (profile or os.environ.get("HARNESS_TOOL_PROFILE") or "auto").strip().lower()
-    if requested in {"full", "all"}:
+    requested = _requested_profile(profile)
+    if requested in _FULL_PROFILES:
         return ALL_TOOLS
-    if requested in {"core", "lite", "lean"}:
+    if requested in _CORE_PROFILES:
         return CORE_TOOLS
 
     text = str(prompt or "").lower()
-    if _contains_any(text, ("all tools", "full tool", "full tools", "entire tool catalog")):
+    if _contains_any(text, _FULL_CATALOG_PHRASES):
         return ALL_TOOLS
 
-    prompt_tokens = _tokenize(text)
-    threshold = float(os.environ.get("HARNESS_TOOL_SCORE_THRESHOLD", "3.0"))
-    max_groups = max(1, int(os.environ.get("HARNESS_TOOL_MAX_GROUPS", "6")))
-    scored = [
-        (name, _score_group(profile, text, prompt_tokens))
-        for name, profile in SPECIALIST_GROUPS.items()
-    ]
-    selected_names = {
-        name
-        for name, score in sorted(scored, key=lambda item: item[1], reverse=True)[:max_groups]
-        if score >= threshold
-    }
-    selected_names = _expand_group_dependencies(selected_names)
+    selected_names = set(select_group_names(prompt, profile))
     selected = [CORE_TOOLS]
     selected.extend(SPECIALIST_GROUPS[name].tools for name in SPECIALIST_GROUPS if name in selected_names)
     return _dedupe_tools(*selected)

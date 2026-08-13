@@ -19,6 +19,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from . import completeness
 from . import core
 from . import rag
 
@@ -67,7 +68,9 @@ def verify_finding(
     the file:line pointers or the request/response you are basing it on.
 
     Returns a verdict (real / false_positive / unproven), what the red team actually found, and
-    the residual risk. Use it before writing a report, not to find bugs."""
+    the residual risk, plus status/coverage for the review itself - a partial status means one of
+    the reviewers argued from capped or truncated evidence, so weigh the verdict accordingly. Use
+    it before writing a report, not to find bugs."""
     try:
         from . import subagent  # lazy: subagent imports are heavy, see module docstring
 
@@ -104,8 +107,14 @@ def verify_finding(
         )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            red_future = pool.submit(subagent._run_subagent_task, red_task, red_model, 6000)
-            blue_future = pool.submit(subagent._run_subagent_task, blue_task, blue_model, 6000)
+            red_future = pool.submit(
+                subagent._run_subagent_task, red_task, red_model, 6000,
+                entry_point="verify_finding_red",
+            )
+            blue_future = pool.submit(
+                subagent._run_subagent_task, blue_task, blue_model, 6000,
+                entry_point="verify_finding_blue",
+            )
             red, blue = red_future.result(), blue_future.result()
 
         red_text = str(red.get("result") or red.get("error") or "")
@@ -129,6 +138,8 @@ def verify_finding(
             judge_task, judge_model, 4000,
             validator=subagent.build_validator(require_json=True, require_keys=["verdict"]),
             max_attempts=2,
+            validator_kinds=["require_json", "require_keys"],
+            entry_point="verify_finding_judge",
         )
 
         parsed: dict[str, Any] | None = None
@@ -139,11 +150,26 @@ def verify_finding(
         except Exception:
             parsed = None
 
+        # The three inner runs each computed a completeness verdict; dropping them here would make
+        # this - the highest-stakes delegated output in the delegate preset, the one a report gets
+        # written from - the only one with no coverage information at all. A 'false_positive'
+        # reached because the red reviewer's grep returned 50 of 900 matches must not be
+        # indistinguishable from one reached on complete evidence.
+        review_signals: list[dict[str, Any]] = []
+        for run in (red, blue, verdict):
+            review_signals.extend((run.get("coverage") or {}).get("signals") or [])
+        if not (red.get("ok") and blue.get("ok")):
+            review_signals.append({
+                "tool": "verify_finding", "reason": "reviewer_run_failed",
+                "returned": sum(1 for r in (red, blue) if r.get("ok")), "total": 2,
+            })
+
         return core.to_json({
             "ok": True,
             "claim": core.trim_text(claim, 500),
             "target": target,
             "verdict": (parsed or {}).get("verdict", "unproven"),
+            **completeness.envelope(True, review_signals),
             "judgement": parsed if parsed is not None else core.trim_text(str(verdict.get("result")), 2000),
             "red_team": {"model": red.get("model"), "ok": red.get("ok"), "argument": core.trim_text(red_text, 2500)},
             "blue_team": {"model": blue.get("model"), "ok": blue.get("ok"), "argument": core.trim_text(blue_text, 2500)},

@@ -25,6 +25,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from . import completeness
 from . import core
 from . import permissions
 
@@ -103,10 +104,27 @@ def _run_job(job_id: str, record: dict[str, Any], kind: str, kwargs: dict[str, A
         try:
             payload = json.loads(raw)
         except Exception:
-            payload = {"ok": True, "result": str(raw)}
+            # An unparseable reply from a delegation tool means core.to_json trimmed it at
+            # MAX_OUTPUT_BYTES - i.e. bytes were lost, and the completeness verdict was in them.
+            # Calling that ok with a null status would restore the exact laundering this envelope
+            # exists to stop, on the path (a big async sweep) where it matters most.
+            payload = {
+                "ok": True,
+                "result": str(raw),
+                **completeness.envelope(True, [{
+                    "tool": kind, "reason": "tool_output_trimmed_256kb",
+                    "returned": len(str(raw)), "total": None,
+                }]),
+            }
         record["status"] = "done"
         record["ok"] = bool(payload.get("ok", True))
         record["result"] = payload
+        # Hoisted out of the payload because check_job's default view replaces the whole result
+        # with a 2000-char head stub - a coverage verdict buried inside it would only be visible
+        # to a caller who already knew to ask for full=true. Named delegation_status because
+        # this record's own "status" already means running/done/error.
+        record["delegation_status"] = payload.get("status")
+        record["coverage"] = payload.get("coverage")
         log_progress(job_id, f"finished ok={record['ok']} in {round(time.time()-started,1)}s")
     except Exception as exc:
         record["status"] = "error"
@@ -148,13 +166,18 @@ def spawn_subagent_async(
     require_keys_json: str = "",
     judge_model: str = "",
     max_attempts: int = 0,
+    require_citations: bool = False,
+    citation_min: int = 1,
 ) -> str:
     """Start a delegated sub-task in the BACKGROUND and return a job_id immediately, instead of
     blocking until it finishes like spawn_subagent does.
 
     Use for work measured in minutes - a long scan, a sweep over a big tree, anything you would
     otherwise wait on. Do something else, then call check_job(job_id) to collect it. Same task
-    contract and acceptance criteria as spawn_subagent.
+    contract as spawn_subagent, and the acceptance criteria exposed above (min_length,
+    require_json/require_keys_json, judge_model, require_citations/citation_min, max_attempts) -
+    require_substrings_json, require_regex and escalate_models are NOT exposed here; use the
+    blocking spawn_subagent when you need them.
 
     The background thread dies with this MCP server process (i.e. with your session), so this is
     for long-running, not overnight - use an automation for that. Poll with check_job; the full
@@ -172,6 +195,10 @@ def spawn_subagent_async(
             "require_keys_json": require_keys_json,
             "judge_model": judge_model,
             "max_attempts": max_attempts,
+            # This dict IS the call: _run_job invokes the tool with it, so a parameter added to
+            # the signature above and not here is accepted from the caller and then dropped.
+            "require_citations": require_citations,
+            "citation_min": citation_min,
         })
         return core.to_json({
             "ok": True,
@@ -190,6 +217,9 @@ def spawn_subagents_parallel_async(
     """Start a parallel fan-out in the BACKGROUND and return a job_id immediately. Same as
     spawn_subagents_parallel (tasks_json is a JSON list of task strings, each run by its own
     isolated sub-agent concurrently) but non-blocking - collect it later with check_job."""
+    # No acceptance criteria are exposed here at all (unlike the two async wrappers above), so
+    # citations are deliberately left off too - adding them as this tool's SOLE quality gate
+    # would be an odd, inconsistent surface. Add the whole criteria set or none.
     if not (tasks_json or "").strip():
         return core.to_json({"ok": False, "error": "tasks_json is required"})
     try:
@@ -217,13 +247,19 @@ def spawn_map_reduce_async(
     max_files: int = 200,
     max_result_chars: int = 1500,
     require_regex: str = "",
+    require_citations: bool = False,
+    citation_min: int = 1,
 ) -> str:
     """Start a map/reduce sweep over a glob in the BACKGROUND and return a job_id immediately.
 
     The blocking spawn_map_reduce is the right call for a handful of files; a few hundred takes
     long enough that you want it off your critical path. Same semantics otherwise - the harness
     expands the glob itself, so the file list never enters your context. Collect with check_job
-    or wait_for_jobs."""
+    or wait_for_jobs.
+
+    require_citations (with citation_min) applies to each per-file answer exactly as in
+    spawn_map_reduce: the answer must cite that many real workspace files as path:line, verified
+    against the filesystem rather than taken on trust."""
     if not (glob_pattern or "").strip() or not (map_prompt or "").strip():
         return core.to_json({"ok": False, "error": "glob_pattern and map_prompt are required"})
     try:
@@ -235,6 +271,8 @@ def spawn_map_reduce_async(
             "max_files": max_files,
             "max_result_chars": max_result_chars,
             "require_regex": require_regex,
+            "require_citations": require_citations,
+            "citation_min": citation_min,
         })
         return core.to_json({
             "ok": True, "job_id": job_id, "status": "running",
@@ -251,7 +289,13 @@ def check_job(job_id: str, full: bool = False) -> str:
 
     While running, returns just {status, started_at} - a cheap poll that costs almost nothing.
     Once finished, returns the result, bounded to a head unless full=true; the complete record
-    is always on disk at job_path, so nothing is lost by polling cheaply."""
+    is always on disk at job_path, so nothing is lost by polling cheaply.
+
+    status is this JOB's lifecycle (running/done/error). The DELEGATION's own completeness verdict
+    is delegation_status (complete/partial/failed) with its coverage dict, hoisted out of the
+    result so it stays visible even when the result itself is replaced by a head stub. Read a
+    clean delegation_status as no tool having reported a cap, not as proof of exhaustiveness; a
+    partial one means coverage.signals names what was capped, truncated or skipped."""
     job_id = (job_id or "").strip()
     if not job_id:
         return core.to_json({"ok": False, "error": "job_id is required"})
@@ -280,6 +324,8 @@ def check_job(job_id: str, full: bool = False) -> str:
         "elapsed_seconds": record.get("elapsed_seconds"),
         "job_path": str(_job_path(job_id)),
         "progress": _progress_tail(job_id),
+        "delegation_status": record.get("delegation_status"),
+        "coverage": record.get("coverage"),
     }
     if record.get("error"):
         out["error"] = record["error"]
@@ -318,7 +364,12 @@ def wait_for_jobs(
     Set summarize_model to hand the finished batch to one extra cheap sub-agent that reads all
     the results and returns a single synthesis (with summarize_prompt saying what to synthesize
     for) - so a 20-job fan-out comes back as one answer instead of 20. On timeout it returns
-    what has finished so far and flags the jobs still running; nothing is cancelled."""
+    what has finished so far and flags the jobs still running; nothing is cancelled.
+
+    Each job in the index carries delegation_status (complete/partial/failed) - the harness's own
+    completeness verdict for that delegation, kept even when a synthesis replaces the heads,
+    because the synthesis is a model's prose and cannot be trusted to mention a cap. Call
+    check_job on any job that reports partial to see which tool capped."""
     import time
 
     try:
@@ -361,6 +412,9 @@ def wait_for_jobs(
                 "ok": bool(record.get("ok", False)),
                 "label": core.trim_text(record.get("label", ""), 120),
                 "error": record.get("error"),
+                # Status only, not the full coverage dict: a 20-job fan-in must stay cheap, and
+                # the signals are one check_job call away for any job that reports partial.
+                "delegation_status": record.get("delegation_status"),
                 "result_head": body[:_HEAD_CHARS],
                 "result_chars": len(body),
                 "job_path": str(_job_path(job_id)),
@@ -399,7 +453,9 @@ def wait_for_jobs(
                 out["summary"] = str(raw)[:6000]
             # The per-job heads are redundant once a synthesis exists; keep only the index.
             out["jobs"] = [
-                {k: f[k] for k in ("job_id", "ok", "label", "job_path", "result_chars")}
+                # delegation_status stays in the index even when a synthesis replaced the heads:
+                # the synthesis is a model's prose and cannot be trusted to mention a cap.
+                {k: f[k] for k in ("job_id", "ok", "delegation_status", "label", "job_path", "result_chars")}
                 for f in finished
             ]
 

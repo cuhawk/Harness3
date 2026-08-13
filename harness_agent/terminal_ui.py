@@ -537,7 +537,7 @@ def request_permission_confirmation_tui(tool_name: str, args: dict) -> str:
     """The permissions.ConfirmCallback registered for the Textual UI (see ChatApp.on_mount).
 
     Called from whatever background thread is running the turn that hit an ask-policy tool
-    (agent_runtime.py's sequential_tool_node -> permissions.GATE.request) - it MUST block
+    (agent_runtime.py's run_tool_calls -> permissions.GATE.request) - it MUST block
     that calling thread until a decision is made, while safely updating the UI across
     threads. Follows the exact same cross-thread dispatch bridge every other render/output
     function in this module uses (_dispatch_to_ui, built on Textual's App.call_from_thread):
@@ -836,7 +836,7 @@ def _tool_use_title(name: str, args_json: str) -> str:
 def render_tool_use(name: str, args: dict, content: str, session_id: str | None = None) -> None:
     """One combined, collapsed-by-default entry for a tool invocation (call + result
     together), replacing the old separate render_tool_call/render_tool_result pair - see
-    agent_runtime.py's sequential_tool_node, the only caller."""
+    agent_runtime.py's run_tool_calls, the only caller."""
     args_json = json.dumps(args, ensure_ascii=False)
     snippet = content[:4000]
     if _dispatch_to_ui(_write_tool_use_history, name, args_json, snippet, session_id):

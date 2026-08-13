@@ -26,12 +26,14 @@ module docstring for why.
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 from typing import Any, Callable
 
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 
+from . import completeness
 from . import core
 
 # =============================================================================
@@ -122,7 +124,9 @@ def workflow_save(name: str, prompt_template: str = "", description: str = "", s
     Step fields: id (required, unique), mode ("agent" default, or "map" for a per-file fan-out
     over glob), prompt (required), model, glob (map only), reduce_prompt (map only), and accept
     (an object of acceptance criteria: min_length, require_regex, require_json, require_keys,
-    max_attempts). Prompts may reference {variables} passed to workflow_run and {steps.<id>.result}
+    require_citations, citation_min, max_attempts). require_citations makes a step's answer
+    prove itself by citing citation_min real workspace files as path:line, verified against the
+    filesystem. Prompts may reference {variables} passed to workflow_run and {steps.<id>.result}
     from any earlier step; a map step's prompt may also use {file}.
 
     Multi-step workflows run each step through the full delegation machinery - validation, retry,
@@ -244,10 +248,28 @@ def _accept_kwargs(accept: dict[str, Any]) -> dict[str, Any]:
         require_regex=str(accept.get("require_regex") or ""),
         require_json=bool(accept.get("require_json")),
         require_keys=list(accept.get("require_keys") or []),
+        require_citations=bool(accept.get("require_citations")),
+        citation_min=max(1, int(accept.get("citation_min") or 1)),
     )
     if validator is None:
         return {}
-    return {"validator": validator, "max_attempts": int(accept.get("max_attempts") or 0) or None}
+    # Same criterion names _validation_kwargs reports, so a workflow step is not recorded in the
+    # outcome ledger as criteria-free when it in fact ran under a validator.
+    kinds = [
+        name for name, requested in (
+            ("min_length", int(accept.get("min_length") or 0) > 0),
+            ("require_substrings", bool(accept.get("require_substrings"))),
+            ("require_regex", bool(accept.get("require_regex"))),
+            ("require_json", bool(accept.get("require_json"))),
+            ("require_keys", bool(accept.get("require_keys"))),
+            ("require_citations", bool(accept.get("require_citations"))),
+        ) if requested
+    ]
+    return {
+        "validator": validator,
+        "max_attempts": int(accept.get("max_attempts") or 0) or None,
+        "validator_kinds": kinds,
+    }
 
 
 def _run_steps(record: dict[str, Any], variables: dict[str, Any]) -> dict[str, Any]:
@@ -261,6 +283,12 @@ def _run_steps(record: dict[str, Any], variables: dict[str, Any]) -> dict[str, A
     step_results: dict[str, str] = {}
     trace: list[dict[str, Any]] = []
     final_text = ""
+    # A pipeline is only as complete as the evidence it ran on, and workflow_run is the tool whose
+    # whole selling point is that the intermediate results never reach the caller - so the caller
+    # cannot re-derive this from the trace even in principle. Folding every step's signals up is
+    # what lets `outcome["status"]` be a field a caller can key on, the same as every other
+    # delegation entry point.
+    pipeline_signals: list[dict[str, Any]] = []
 
     def _scope() -> dict[str, Any]:
         scope: dict[str, Any] = dict(variables)
@@ -293,6 +321,7 @@ def _run_steps(record: dict[str, Any], variables: dict[str, Any]) -> dict[str, A
                     f"{sorted('{steps.' + s + '.result}' for s in step_results)}"
                 ),
                 "steps_completed": len(trace),
+                **completeness.envelope(False, pipeline_signals),
                 "trace": trace,
             }
 
@@ -320,32 +349,50 @@ def _run_steps(record: dict[str, Any], variables: dict[str, Any]) -> dict[str, A
                 "id": step_id, "mode": "map", "ok": ok,
                 "files_mapped": payload.get("files_mapped"),
                 "files_skipped_over_cap": payload.get("files_skipped_over_cap"),
+                # Without this a map step that examined 20 of 400 files still reads as a clean
+                # green step in the trace, and the pipeline's final answer inherits that claim.
+                "status": payload.get("status"),
+                "coverage": payload.get("coverage"),
                 "result_preview": core.trim_text(str(text), 400),
             })
+            pipeline_signals.extend((payload.get("coverage") or {}).get("signals") or [])
         else:
             result = subagent._run_subagent_task(
-                prompt, step.get("model") or "", 8000, spill_over_chars=8000, **accept
+                prompt, step.get("model") or "", 8000, spill_over_chars=8000,
+                entry_point="workflow", **accept
             )
             text = result.get("result") or ""
             ok = bool(result.get("ok"))
             trace.append({
                 "id": step_id, "mode": "agent", "ok": ok, "model": result.get("model"),
                 "attempts": result.get("attempts"),
+                "status": result.get("status"),
                 "result_preview": core.trim_text(str(text), 400),
             })
+            pipeline_signals.extend((result.get("coverage") or {}).get("signals") or [])
 
         if not ok:
             return {
                 "ok": False,
                 "error": f"step '{step_id}' failed; pipeline stopped so later steps do not build on a bad result",
                 "steps_completed": len(trace) - 1,
+                **completeness.envelope(False, pipeline_signals),
                 "trace": trace,
             }
 
         step_results[step_id] = str(text)
         final_text = str(text)
 
-    return {"ok": True, "steps_run": len(steps), "trace": trace, "result": final_text}
+    # The envelope goes before "trace"/"result" for the same reason spawn_map_reduce splices its
+    # own in early: core.to_json trims the reply at MAX_OUTPUT_BYTES, and a long trace must not be
+    # able to push the verdict past the cut.
+    return {
+        "ok": True,
+        "steps_run": len(steps),
+        **completeness.envelope(True, pipeline_signals),
+        "trace": trace,
+        "result": final_text,
+    }
 
 
 @tool
@@ -359,7 +406,11 @@ def workflow_run(name: str, variables_json: str = "{}") -> str:
     in the harness, so a five-stage pipeline costs you one result instead of five. A step that
     fails stops the pipeline rather than letting later steps build on a bad result.
 
-    A single-template workflow behaves as before: the expanded text is run as one task."""
+    A single-template workflow behaves as before: the expanded text is run as one task.
+
+    Either form returns status (complete/partial/failed) and coverage for the pipeline as a whole,
+    stamped by the harness from the raw tool results - a multi-step run is partial if ANY step
+    ran on capped evidence, which you could not otherwise tell from the final answer alone."""
     try:
         key = core.safe_name(name)
         workflows = workflow_load_all()
@@ -397,7 +448,18 @@ def workflow_run(name: str, variables_json: str = "{}") -> str:
         if runtime is None:
             return core.to_json({"ok": False, "error": "Runtime provider returned no runtime instance"})
 
+        # This path runs the LIVE shared runtime directly instead of going through
+        # _run_subagent_task, so it gets none of that function's exit-point bookkeeping for free.
+        # Draining the recorder here is doubly load-bearing: it is the only way this run reports a
+        # cap, AND without it the shared runtime's signal list grows for the life of the server
+        # and leaks this run's caps into whatever the operator does next.
+        from . import ledger, subagent
+
+        started = time.monotonic()
+        subagent._drain_signals(runtime, [])  # discard anything left over from an earlier turn
+        signals: list[dict[str, Any]] = []
         result = runtime.invoke(expanded_task)
+        subagent._drain_signals(runtime, signals)
 
         answer = "[no final content]"
         for msg in reversed(result.get("messages", [])):
@@ -410,10 +472,20 @@ def workflow_run(name: str, variables_json: str = "{}") -> str:
         workflows[key] = record
         workflow_save_all(workflows)
 
+        envelope = completeness.envelope(True, signals)
+        ledger.record_delegation(
+            task=expanded_task, model=str(getattr(runtime, "model_name", "") or ""),
+            ok=True, accepted=True, attempts=1,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            # Read off the envelope just built, never re-derived: one verdict, one deriving site.
+            status=str(envelope["status"]),
+            entry_point="workflow_template",
+        )
         return core.to_json({
             "ok": True,
             "name": key,
             "expanded_task": core.trim_text(expanded_task),
+            **envelope,
             "result": answer,
         })
     except Exception as e:

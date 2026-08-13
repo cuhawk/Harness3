@@ -86,6 +86,9 @@ PRESETS: dict[str, list[str]] = {
         "compare_models", "verify_finding",
         "spawn_subagent_async", "spawn_subagents_parallel_async", "spawn_map_reduce_async",
         "check_job", "wait_for_jobs", "list_jobs",
+        # One extra schema, so the host can ask which model actually works for a shape of task
+        # instead of re-deriving it from memory each session.
+        "delegation_stats",
         "set_briefing", "get_briefing",
         "extract_findings", "findings_search", "findings_stats",
         "dossier_note", "dossier_get", "dossier_set_active", "dossier_targets",

@@ -118,5 +118,35 @@ class RetryLoopTests(unittest.TestCase):
         self.assertEqual(result["model"], "stronger")
 
 
+class CitationRetryTests(unittest.TestCase):
+    """The citation check has to compose with the existing retry loop like any other criterion:
+    reject, feed the reason back, accept the corrected answer."""
+
+    def setUp(self):
+        import tempfile
+
+        self._previous_workspace = str(core.WORKSPACE)
+        self._tmp = tempfile.TemporaryDirectory()
+        core.set_workspace(self._tmp.name)
+        (core.WORKSPACE / "src").mkdir(parents=True, exist_ok=True)
+        (core.WORKSPACE / "src" / "app.py").write_text("a\nb\nc\n" * 10, encoding="utf-8")
+
+    def tearDown(self):
+        core.set_workspace(self._previous_workspace)
+        self._tmp.cleanup()
+
+    def test_retries_until_the_answer_cites_a_real_file(self):
+        rt = FakeRuntime("m", ["no citations here", "found it in src/app.py:12"])
+        validator = subagent.build_validator(require_citations=True)
+        result = subagent._run_subagent_task(
+            "explain the guard", "m", validator=validator, max_attempts=2,
+            runtime_factory=lambda m: rt,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertIn("not accepted", rt.calls[1][1])
+        self.assertIn("verified file citation", rt.calls[1][1])
+
+
 if __name__ == "__main__":
     unittest.main()

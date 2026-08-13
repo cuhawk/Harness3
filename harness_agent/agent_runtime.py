@@ -24,6 +24,7 @@ from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 
+from . import completeness
 from . import core
 from . import hooks
 from . import permissions
@@ -233,6 +234,12 @@ class AgentRuntime:
         # non-deterministic. Pinning it to the human-message index means it's recomputed
         # only when the user actually sends new input, not on every agent<->tool hop.
         self._tool_selection_cache: tuple[int, list[BaseTool]] | None = None
+        # Every cap/truncation this runtime's tools admit to, so a delegation can report how
+        # complete it actually was instead of trusting the model's prose. run_tool_calls reads
+        # self.completeness at CALL time, so the recorder deliberately survives switch_model()'s
+        # graph rebuild - an escalation mid-delegation must not amnesty the caps the earlier
+        # attempt hit.
+        self.completeness = completeness.CompletenessRecorder()
         self.graph = self._build_graph(model_name)
 
     def _build_llm(self, model_name: str, tools: list[BaseTool]):
@@ -294,71 +301,87 @@ class AgentRuntime:
                 return "tools"
             return END
 
-        def sequential_tool_node(state: MessagesState):
-            last = state["messages"][-1]
-            tool_calls = getattr(last, "tool_calls", None) or []
-            outputs: list[ToolMessage] = []
-            for call in tool_calls:
-                name = call.get("name")
-                args = call.get("args") or {}
-                call_id = call.get("id") or "missing-tool-call-id"
-                tool_obj = TOOL_BY_NAME.get(name)
-                if tool_obj is None:
-                    content = core.to_json({"ok": False, "error": f"Unknown tool: {name}"})
-                else:
-                    pre_result = hooks.run_hooks("PreToolUse", {"tool_name": name, "args": args})
-                    if pre_result.get("blocked"):
-                        content = core.to_json({
-                            "ok": False,
-                            "tool": name,
-                            "error": "blocked by hook",
-                            "reason": pre_result.get("reason"),
-                        })
-                    else:
-                        allowed, reason = permissions.GATE.request(name, args)
-                        if not allowed:
-                            content = core.to_json({
-                                "ok": False,
-                                "tool": name,
-                                "error": "blocked by permission policy",
-                                "reason": reason,
-                            })
-                        else:
-                            try:
-                                content = tool_obj.invoke(args)
-                            except Exception as exc:
-                                content = core.to_json({"ok": False, "tool": name, "error": repr(exc)})
-                            else:
-                                try:
-                                    hooks.run_hooks("PostToolUse", {
-                                        "tool_name": name,
-                                        "args": args,
-                                        "result": core.trim_text(str(content), 4000),
-                                    })
-                                except Exception:
-                                    pass
-                if core.SHOW_THINKING:
-                    # One combined call+result entry (collapsed by default in the Textual UI -
-                    # see terminal_ui.render_tool_use) rather than two separate render calls,
-                    # so a tool invocation reads as a single foldable block instead of two
-                    # disconnected lines.
-                    terminal_ui.render_tool_use(name or "unknown", args, str(content), session_id=self.session_id)
-                model_content = compact_tool_result_for_model(content)
-                outputs.append(ToolMessage(
-                    content=model_content,
-                    name=name or "unknown",
-                    tool_call_id=call_id,
-                    artifact=tool_result_artifact(content, model_content),
-                ))
-            return {"messages": outputs}
-
         builder = StateGraph(MessagesState)
         builder.add_node("agent", call_model)
-        builder.add_node("tools", sequential_tool_node)
+        builder.add_node("tools", self.run_tool_calls)
         builder.add_edge(START, "agent")
         builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
         builder.add_edge("tools", "agent")
         return builder.compile()
+
+    def run_tool_calls(self, state: MessagesState):
+        """The graph's tool node. A METHOD rather than a closure inside _build_graph so a test
+        can drive one real tool call through it - this is the only production site that feeds the
+        completeness recorder, and while it lived inside the closure the whole feature could be
+        deleted with the suite still green (compute_status returns a clean verdict when no signal
+        was recorded, so a broken recorder looks exactly like a clean run)."""
+        last = state["messages"][-1]
+        tool_calls = getattr(last, "tool_calls", None) or []
+        outputs: list[ToolMessage] = []
+        for call in tool_calls:
+            name = call.get("name")
+            args = call.get("args") or {}
+            call_id = call.get("id") or "missing-tool-call-id"
+            tool_obj = TOOL_BY_NAME.get(name)
+            # Only a real tool invocation is evidence. The unknown-tool, hook-block,
+            # permission-block and exception envelopes below are synthesised by this node, and
+            # scanning them would let an error masquerade as a coverage gap.
+            invoked = False
+            if tool_obj is None:
+                content = core.to_json({"ok": False, "error": f"Unknown tool: {name}"})
+            else:
+                pre_result = hooks.run_hooks("PreToolUse", {"tool_name": name, "args": args})
+                if pre_result.get("blocked"):
+                    content = core.to_json({
+                        "ok": False,
+                        "tool": name,
+                        "error": "blocked by hook",
+                        "reason": pre_result.get("reason"),
+                    })
+                else:
+                    allowed, reason = permissions.GATE.request(name, args)
+                    if not allowed:
+                        content = core.to_json({
+                            "ok": False,
+                            "tool": name,
+                            "error": "blocked by permission policy",
+                            "reason": reason,
+                        })
+                    else:
+                        try:
+                            content = tool_obj.invoke(args)
+                        except Exception as exc:
+                            content = core.to_json({"ok": False, "tool": name, "error": repr(exc)})
+                        else:
+                            invoked = True
+                            try:
+                                hooks.run_hooks("PostToolUse", {
+                                    "tool_name": name,
+                                    "args": args,
+                                    "result": core.trim_text(str(content), 4000),
+                                })
+                            except Exception:
+                                pass
+            if core.SHOW_THINKING:
+                # One combined call+result entry (collapsed by default in the Textual UI -
+                # see terminal_ui.render_tool_use) rather than two separate render calls,
+                # so a tool invocation reads as a single foldable block instead of two
+                # disconnected lines.
+                terminal_ui.render_tool_use(name or "unknown", args, str(content), session_id=self.session_id)
+            model_content = compact_tool_result_for_model(content)
+            if invoked:
+                # BOTH halves, and they have to be recorded together: the RAW content carries the
+                # cap keys the detector matches on (compaction rewrites them away), while the
+                # difference between raw and model_content IS the harness's own truncation - the
+                # commonest one in the system and, before this, the only one nobody reported.
+                self.completeness.record(name or "unknown", content, model_content=model_content)
+            outputs.append(ToolMessage(
+                content=model_content,
+                name=name or "unknown",
+                tool_call_id=call_id,
+                artifact=tool_result_artifact(content, model_content),
+            ))
+        return {"messages": outputs}
 
     def switch_model(self, model_name: str) -> None:
         self.model_name = model_name
@@ -388,7 +411,7 @@ class AgentRuntime:
         """Like invoke(), but calls on_token(text) for each incremental chunk of the
         model's natural-language output as it's generated, instead of waiting for the full
         response. Tool calls/results still render through the normal render_tool_use path
-        inside sequential_tool_node - only the model's own text streams token by token,
+        inside run_tool_calls - only the model's own text streams token by token,
         since tool-call args arrive as one structured blob rather than readable text.
 
         stream_mode=["messages", "values"] tags every yielded item as (mode, payload):
