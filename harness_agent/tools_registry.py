@@ -389,7 +389,65 @@ def _requested_profile(profile: str | None) -> str:
     return (profile or os.environ.get("HARNESS_TOOL_PROFILE") or "auto").strip().lower()
 
 
-def select_group_names(prompt: str = "", profile: str | None = None) -> list[str]:
+# Core sub-groups, pinnable by name. CORE_TOOLS is 38 tools on its own - already past the
+# size where models start corrupting tool ARGUMENTS rather than picking the wrong tool - so a
+# pin able only to subtract specialist groups would not fix the thing it exists for. Measured
+# on nemotron at temperature 0: bound 1 tool, it emits query='tsg_id' 3/3; bound the 86 this
+# scorer picks for the same one-tool prompt, it emits 'tsk_id' 5/5, which greps to zero
+# matches and is then reported as a confident, complete "0".
+_CORE_SUBGROUPS: dict[str, list[BaseTool]] = {
+    "core": CORE_TOOLS,
+    "filesystem": FILESYSTEM_TOOLS,
+    "terminal": TERMINAL_GIT_TOOLS,
+    "memory": MEMORY_TOOLS,
+    "tasks": TASK_TOOLS,
+    "briefing": BRIEFING_TOOLS,
+}
+
+
+def pinnable_group_names() -> list[str]:
+    """Every group name accepted by the ``groups`` pin, for error messages and tool docs."""
+    return sorted(set(_CORE_SUBGROUPS) | set(SPECIALIST_GROUPS))
+
+
+def _resolve_group_name(raw: str) -> str:
+    """Map one caller-supplied group name (or alias) to a canonical name, or raise."""
+    name = str(raw or "").strip().lower().replace("-", "_")
+    if name in _CORE_SUBGROUPS or name in SPECIALIST_GROUPS:
+        return name
+    for canonical, group in SPECIALIST_GROUPS.items():
+        if name in {alias.strip().lower().replace("-", "_") for alias in group.aliases}:
+            return canonical
+    # Loud, not silent. A typo'd pin that fell through to scoring would restore the very
+    # 86-tool binding the caller pinned to avoid, and nothing downstream would show why.
+    raise ValueError(
+        "unknown tool group %r; valid groups: %s" % (raw, ", ".join(pinnable_group_names()))
+    )
+
+
+def resolve_pinned_groups(groups: list[str] | tuple[str, ...] | None) -> list[str] | None:
+    """Canonical, dependency-expanded group names for an explicit pin (None if not pinned).
+
+    An empty list is treated as "no pin" rather than "bind nothing": binding zero tools makes
+    a sub-agent fail in a way that reads like a model problem.
+    """
+    if not groups:
+        return None
+    names = {_resolve_group_name(g) for g in groups}
+    specialists = {n for n in names if n in SPECIALIST_GROUPS}
+    expanded = _expand_group_dependencies(specialists) if specialists else set()
+    return sorted(expanded | {n for n in names if n in _CORE_SUBGROUPS})
+
+
+def _pinned_tools(names: list[str]) -> list[BaseTool]:
+    parts = [_CORE_SUBGROUPS[n] for n in names if n in _CORE_SUBGROUPS]
+    parts.extend(SPECIALIST_GROUPS[n].tools for n in names if n in SPECIALIST_GROUPS)
+    return _dedupe_tools(*parts)
+
+
+def select_group_names(
+    prompt: str = "", profile: str | None = None, groups: list[str] | None = None
+) -> list[str]:
     """Score the specialist groups for one prompt and return the chosen names, SORTED.
 
     Split out of ``select_tools``, which computed exactly this set and then threw the names
@@ -402,7 +460,15 @@ def select_group_names(prompt: str = "", profile: str | None = None) -> list[str
 
     The fixed profiles return ``[]``: they bind a whole catalog without scoring anything, so
     there is no group selection to report.
+
+    An explicit ``groups`` pin outranks both the profile and the scorer, and IS reported - the
+    ledger's task_shape should record the tools a pinned run actually bound, not the ones the
+    scorer would have guessed at.
     """
+    pinned = resolve_pinned_groups(groups)
+    if pinned is not None:
+        return pinned
+
     requested = _requested_profile(profile)
     if requested in _FULL_PROFILES or requested in _CORE_PROFILES:
         return []
@@ -426,14 +492,25 @@ def select_group_names(prompt: str = "", profile: str | None = None) -> list[str
     return sorted(_expand_group_dependencies(selected_names))
 
 
-def select_tools(prompt: str = "", profile: str | None = None) -> list[BaseTool]:
+def select_tools(
+    prompt: str = "", profile: str | None = None, groups: list[str] | None = None
+) -> list[BaseTool]:
     """Return the tool set to bind for one model call.
 
     Profiles:
     - ``auto``/``smart`` (default): core tools plus locally scored specialist groups.
     - ``core``/``lite``/``lean``: filesystem, terminal/git, memory, and tasks.
     - ``full``/``all``: every tool, matching the original behavior.
+
+    ``groups`` pins the selection explicitly and skips scoring entirely - for a caller that
+    already knows what the task needs, which is every programmatic fan-out. A pin REPLACES the
+    whole selection, core included: ``groups=["filesystem"]`` binds 14 tools, not CORE's 38
+    plus 14. That is the point - see ``_CORE_SUBGROUPS`` for the measurement.
     """
+    pinned = resolve_pinned_groups(groups)
+    if pinned is not None:
+        return _pinned_tools(pinned)
+
     requested = _requested_profile(profile)
     if requested in _FULL_PROFILES:
         return ALL_TOOLS
@@ -444,7 +521,7 @@ def select_tools(prompt: str = "", profile: str | None = None) -> list[BaseTool]
     if _contains_any(text, _FULL_CATALOG_PHRASES):
         return ALL_TOOLS
 
-    selected_names = set(select_group_names(prompt, profile))
+    selected_names = set(select_group_names(prompt, profile, groups))
     selected = [CORE_TOOLS]
     selected.extend(SPECIALIST_GROUPS[name].tools for name in SPECIALIST_GROUPS if name in selected_names)
     return _dedupe_tools(*selected)
@@ -460,7 +537,10 @@ def _human_texts(messages: list[Any]) -> list[str]:
 
 
 def select_tools_for_messages(
-    messages: list[Any], profile: str | None = None, pin_to_first: bool = False
+    messages: list[Any],
+    profile: str | None = None,
+    pin_to_first: bool = False,
+    groups: list[str] | None = None,
 ) -> list[BaseTool]:
     """Select tools from a LangChain message list.
 
@@ -473,7 +553,13 @@ def select_tools_for_messages(
     task retried with "your previous answer was too short" scores nothing browser-ish and
     comes back with no browser tools bound). Scoring the task and the latest turn together
     keeps the task's tools while still reacting to what the new turn asks for.
+
+    ``groups`` short-circuits all of that: an explicitly pinned run binds the same tools on
+    every turn, so retry feedback and resume follow-ups cannot move it at all.
     """
+    if groups:
+        return select_tools("", profile=profile, groups=groups)
+
     humans = _human_texts(messages)
     if not humans:
         prompt = ""

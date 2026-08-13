@@ -212,12 +212,22 @@ def list_proxy_models() -> list[str]:
 # =============================================================================
 
 class AgentRuntime:
-    def __init__(self, model_name: str, session_id: str | None = None, pin_tools_to_task: bool = False):
+    def __init__(
+        self,
+        model_name: str,
+        session_id: str | None = None,
+        pin_tools_to_task: bool = False,
+        tool_groups: list[str] | None = None,
+    ):
         self.model_name = model_name
         # Delegated runs set this: score tool selection off the ORIGINAL task plus the latest
         # turn, not the latest turn alone. See tools_registry.select_tools_for_messages.
         # Left False for interactive sessions, where following the newest message is correct.
         self.pin_tools_to_task = pin_tools_to_task
+        # An explicit pin from the caller, which skips scoring altogether. Resolved once here
+        # so a bad group name fails at construction - where the caller can see it - instead of
+        # inside the graph loop on the first model call.
+        self.tool_groups = tools_registry.resolve_pinned_groups(tool_groups)
         # Set by sessions.SessionManager.create_runtime for every runtime it owns - threaded
         # into the render_thinking/render_tool_use calls below so a background tab's turn
         # always writes into ITS OWN scrollback, not whichever tab the user happens to be
@@ -270,7 +280,7 @@ class AgentRuntime:
                 selected_tools = self._tool_selection_cache[1]
             else:
                 selected_tools = tools_registry.select_tools_for_messages(
-                    messages, pin_to_first=self.pin_tools_to_task
+                    messages, pin_to_first=self.pin_tools_to_task, groups=self.tool_groups
                 )
                 self._tool_selection_cache = (last_human_idx, selected_tools)
             llm_with_tools = self._llm_for_tools(selected_tools)

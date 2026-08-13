@@ -41,6 +41,27 @@ from . import sessions
 Validator = Callable[[str], "tuple[bool, str]"]
 
 
+def _parse_tool_groups(raw: str) -> list[str] | None:
+    """Comma-separated tool-group pin -> list, or None when the caller did not pin.
+
+    Comma-separated rather than a real list because every other multi-value parameter on these
+    tools is (``escalate_models``, the ``*_json`` pair): a delegated model that has to emit a
+    JSON array for one argument and a bare string for the next gets it wrong often enough to
+    matter, and this argument exists precisely to stop models mangling arguments.
+    """
+    names = [part.strip() for part in str(raw or "").split(",") if part.strip()]
+    if not names:
+        return None
+    # Validate HERE, not lazily in the runtime factory. The factory runs inside the attempt
+    # loop, which treats any raise as "this attempt failed" and escalates to the next model -
+    # so an unknown group name would burn the whole attempt budget and surface as a model
+    # problem instead of the typo it is. Lazy import: tools_registry imports this module.
+    from . import tools_registry
+
+    tools_registry.resolve_pinned_groups(names)
+    return names
+
+
 def _fanout_workers(task_count: int) -> int:
     """How many sub-agents to run concurrently in a fan-out.
 
@@ -844,6 +865,7 @@ def _run_subagent_task(
     glob_involved: bool = False,
     validator_kinds: list[str] | None = None,
     entry_point: str = "",
+    tool_groups: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run one isolated sub-agent task, looping until the result passes ``validator`` (or the
     attempt budget is exhausted). Returns a plain dict (both public tools wrap it in their own
@@ -875,7 +897,7 @@ def _run_subagent_task(
         from .agent_runtime import AgentRuntime
 
         def runtime_factory(m: str) -> Any:  # type: ignore[misc]
-            rt = AgentRuntime(m, pin_tools_to_task=True)
+            rt = AgentRuntime(m, pin_tools_to_task=True, tool_groups=tool_groups)
             # Restoring inside the FACTORY (rather than seeding a runtime before the loop) is
             # what makes resume compose with the existing retry logic untouched: the loop's
             # "runtime is None -> send the task fresh" rule still holds, and an attempt that
@@ -1088,6 +1110,7 @@ def spawn_subagent(
     max_result_chars: int = 6000,
     require_citations: bool = False,
     citation_min: int = 1,
+    tool_groups: str = "",
 ) -> str:
     """Delegate a self-contained sub-task to a fresh isolated agent sub-run that shares this
     workspace and all tools, but starts with empty history. Use for large, self-contained
@@ -1134,12 +1157,27 @@ def spawn_subagent(
     by the harness from the raw tool results, never by the sub-agent. Read a clean status as NO
     TOOL REPORTED A CAP - not as proof the run was exhaustive; some tools truncate silently. A
     partial status means coverage.signals names what was capped, truncated or skipped, and you
-    should treat the answer as drawn from incomplete evidence."""
+    should treat the answer as drawn from incomplete evidence.
+
+    tool_groups: comma-separated groups to bind, e.g. "filesystem" or "browser,filesystem".
+    Left empty, the harness scores the task text and picks for you - which for a narrow task
+    routinely binds ~86 of 113 tools, and a large bound set makes models corrupt tool ARGUMENTS
+    (measured: a query argument silently typo'd, which then matched nothing and was reported as
+    a clean zero). Name the groups whenever you know them. A pin replaces the whole selection
+    including the core set, so "filesystem" means 14 tools, not 52. Valid: core, filesystem,
+    terminal, memory, tasks, briefing, web, browser, graphql, rag, process, mcp, delegation,
+    workflow, automation, policy, ssh, verify, extract, dossier. An unknown name is an error,
+    never a silent fallback to scoring."""
     if core.SUBAGENT_DEPTH >= core.MAX_SUBAGENT_DEPTH:
         return core.to_json({
             "ok": False,
             "error": f"Sub-agent depth limit reached ({core.MAX_SUBAGENT_DEPTH}); refusing to spawn another sub-agent to avoid runaway recursion.",
         })
+
+    try:
+        pinned_groups = _parse_tool_groups(tool_groups)
+    except ValueError as exc:
+        return core.to_json({"ok": False, "error": str(exc)})
 
     core.SUBAGENT_DEPTH += 1
     try:
@@ -1153,6 +1191,7 @@ def spawn_subagent(
             session_name=session_name,
             spill_over_chars=max(0, int(max_result_chars or 0)),
             entry_point="spawn_subagent",
+            tool_groups=pinned_groups,
             **kwargs,
         )
         return core.to_json(result)
@@ -1176,6 +1215,7 @@ def resume_subagent(
     escalate_models: str = "",
     require_citations: bool = False,
     citation_min: int = 1,
+    tool_groups: str = "",
 ) -> str:
     """Continue a previously persisted sub-agent conversation, with its FULL prior history
     (its earlier reasoning, tool calls, and tool results) still in context. Requires a
@@ -1192,7 +1232,11 @@ def resume_subagent(
     reopen anything it needs. It keeps the session's original model unless model_name
     overrides it, and it supports the same acceptance criteria as spawn_subagent. The
     session is re-saved after this turn, so you can resume repeatedly. The reply carries the same
-    harness-stamped status/coverage pair as spawn_subagent."""
+    harness-stamped status/coverage pair as spawn_subagent.
+
+    tool_groups: a tool pin is NOT persisted with the session, so a resumed run is scored from
+    scratch unless you re-pin it here. Pass the same groups the original spawn used, or the
+    sub-agent silently gets a much wider tool set on its next turn than it had on its last."""
     if core.SUBAGENT_DEPTH >= core.MAX_SUBAGENT_DEPTH:
         return core.to_json({
             "ok": False,
@@ -1215,6 +1259,11 @@ def resume_subagent(
     except Exception as exc:
         return core.to_json({"ok": False, "error": f"Could not load session {session_id}: {exc!r}"})
 
+    try:
+        pinned_groups = _parse_tool_groups(tool_groups)
+    except ValueError as exc:
+        return core.to_json({"ok": False, "error": str(exc)})
+
     core.SUBAGENT_DEPTH += 1
     try:
         kwargs = _validation_kwargs(
@@ -1229,6 +1278,7 @@ def resume_subagent(
             restore_history=raw_history,
             session_id=session_id,
             entry_point="resume_subagent",
+            tool_groups=pinned_groups,
             **kwargs,
         )
         result["resumed_session"] = {"id": session_id, "name": session.name, "turns_restored": len(raw_history)}
@@ -1273,6 +1323,7 @@ def spawn_map_reduce(
     offset: int = 0,
     require_citations: bool = False,
     citation_min: int = 1,
+    tool_groups: str = "",
 ) -> str:
     """Run one sub-agent per file matching a glob, then optionally fold every answer into a
     single synthesis - without the file list ever entering your context.
@@ -1308,12 +1359,22 @@ def spawn_map_reduce(
     glob expansion (covered/total/gaps are counted here, never taken from a model's answer). If
     files were left over, resume_cursor tells you how to finish the sweep - call again with the
     same glob_pattern and max_files and the offset it hands back, and the next batch is picked
-    up in the same sorted order. offset skips that many matched files from the start."""
+    up in the same sorted order. offset skips that many matched files from the start.
+
+    tool_groups: comma-separated groups to bind on every per-file sub-agent, e.g. "filesystem".
+    This matters more here than anywhere else in the harness: a per-file sweep runs the same
+    narrow task hundreds of times, and left to the scorer each run binds ~86 of 113 tools, which
+    is where models start corrupting tool arguments rather than picking wrong tools - and a
+    corrupted grep argument returns zero matches, which reads as a clean per-file "nothing
+    found". Pin it. A pin replaces the whole selection, core included."""
     try:
         if not (glob_pattern or "").strip():
             return core.to_json({"ok": False, "error": "glob_pattern is required"})
         if not (map_prompt or "").strip():
             return core.to_json({"ok": False, "error": "map_prompt is required"})
+        # Validated before the glob expands: a typo'd pin should cost one error message, not a
+        # 200-way fan-out that binds the wrong tools on every one of them.
+        pinned_groups = _parse_tool_groups(tool_groups)
         if core.SUBAGENT_DEPTH >= core.MAX_SUBAGENT_DEPTH:
             return core.to_json({
                 "ok": False,
@@ -1383,6 +1444,7 @@ def spawn_map_reduce(
                         spill_over_chars=max(200, int(max_result_chars or 1500)),
                         glob_involved=True,
                         entry_point="map_reduce",
+                        tool_groups=pinned_groups,
                         # Per-file answers are the least supervised output in the whole harness
                         # (nobody eyeballs 200 of them), so acceptance criteria matter MORE here
                         # than on a single delegation - a malformed answer is otherwise silently
@@ -1531,6 +1593,7 @@ def spawn_subagents_parallel(
     max_result_chars: int = 4000,
     require_citations: bool = False,
     citation_min: int = 1,
+    tool_groups: str = "",
 ) -> str:
     """Fan out several independent, self-contained sub-tasks to fresh isolated agent sub-runs
     concurrently (thread pool), each with its own empty history sharing this workspace and all
@@ -1552,8 +1615,13 @@ def spawn_subagents_parallel(
 
     Completeness: each task carries its own status/coverage, and the batch-level status is only as
     good as its worst task - one task that ran on capped evidence, or failed, makes the batch
-    partial. A clean status means no tool reported a cap, not that the search was exhaustive."""
+    partial. A clean status means no tool reported a cap, not that the search was exhaustive.
+
+    tool_groups: comma-separated groups to bind on every task in the batch, e.g. "filesystem".
+    Applied uniformly like the acceptance criteria, so use it when the batch is one shape of
+    work; leave it empty for a genuinely mixed batch and let each task be scored."""
     try:
+        pinned_groups = _parse_tool_groups(tool_groups)
         tasks = core.parse_json_arg(tasks_json, [])
         if not isinstance(tasks, list) or not tasks or not all(isinstance(t, str) and t.strip() for t in tasks):
             return core.to_json({
@@ -1580,6 +1648,7 @@ def spawn_subagents_parallel(
                         max(200, int(max_result_chars or 4000)),
                         spill_over_chars=max(200, int(max_result_chars or 4000)),
                         entry_point="spawn_subagents_parallel",
+                        tool_groups=pinned_groups,
                         **_validation_kwargs(
                             min_length, require_substrings_json, require_regex, require_json,
                             require_keys_json, judge_model, t, max_attempts, escalate_models,

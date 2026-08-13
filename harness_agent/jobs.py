@@ -168,6 +168,7 @@ def spawn_subagent_async(
     max_attempts: int = 0,
     require_citations: bool = False,
     citation_min: int = 1,
+    tool_groups: str = "",
 ) -> str:
     """Start a delegated sub-task in the BACKGROUND and return a job_id immediately, instead of
     blocking until it finishes like spawn_subagent does.
@@ -177,7 +178,8 @@ def spawn_subagent_async(
     contract as spawn_subagent, and the acceptance criteria exposed above (min_length,
     require_json/require_keys_json, judge_model, require_citations/citation_min, max_attempts) -
     require_substrings_json, require_regex and escalate_models are NOT exposed here; use the
-    blocking spawn_subagent when you need them.
+    blocking spawn_subagent when you need them. tool_groups is exposed and behaves identically:
+    comma-separated groups to bind instead of letting the scorer guess.
 
     The background thread dies with this MCP server process (i.e. with your session), so this is
     for long-running, not overnight - use an automation for that. Poll with check_job; the full
@@ -199,6 +201,7 @@ def spawn_subagent_async(
             # the signature above and not here is accepted from the caller and then dropped.
             "require_citations": require_citations,
             "citation_min": citation_min,
+            "tool_groups": tool_groups,
         })
         return core.to_json({
             "ok": True,
@@ -212,11 +215,13 @@ def spawn_subagent_async(
 
 @tool
 def spawn_subagents_parallel_async(
-    tasks_json: str, model_name: str = "", max_result_chars: int = 4000
+    tasks_json: str, model_name: str = "", max_result_chars: int = 4000, tool_groups: str = ""
 ) -> str:
     """Start a parallel fan-out in the BACKGROUND and return a job_id immediately. Same as
     spawn_subagents_parallel (tasks_json is a JSON list of task strings, each run by its own
-    isolated sub-agent concurrently) but non-blocking - collect it later with check_job."""
+    isolated sub-agent concurrently) but non-blocking - collect it later with check_job.
+
+    tool_groups pins the tool set for every task in the batch, as in spawn_subagents_parallel."""
     # No acceptance criteria are exposed here at all (unlike the two async wrappers above), so
     # citations are deliberately left off too - adding them as this tool's SOLE quality gate
     # would be an odd, inconsistent surface. Add the whole criteria set or none.
@@ -227,6 +232,7 @@ def spawn_subagents_parallel_async(
             "tasks_json": tasks_json,
             "model_name": model_name,
             "max_result_chars": max_result_chars,
+            "tool_groups": tool_groups,
         })
         return core.to_json({
             "ok": True,
@@ -249,6 +255,7 @@ def spawn_map_reduce_async(
     require_regex: str = "",
     require_citations: bool = False,
     citation_min: int = 1,
+    tool_groups: str = "",
 ) -> str:
     """Start a map/reduce sweep over a glob in the BACKGROUND and return a job_id immediately.
 
@@ -259,7 +266,10 @@ def spawn_map_reduce_async(
 
     require_citations (with citation_min) applies to each per-file answer exactly as in
     spawn_map_reduce: the answer must cite that many real workspace files as path:line, verified
-    against the filesystem rather than taken on trust."""
+    against the filesystem rather than taken on trust.
+
+    tool_groups pins the tool set for every per-file sub-agent. Worth setting on any sweep of
+    real size - see spawn_map_reduce for why a wide tool set corrupts per-file answers."""
     if not (glob_pattern or "").strip() or not (map_prompt or "").strip():
         return core.to_json({"ok": False, "error": "glob_pattern and map_prompt are required"})
     try:
@@ -273,6 +283,7 @@ def spawn_map_reduce_async(
             "require_regex": require_regex,
             "require_citations": require_citations,
             "citation_min": citation_min,
+            "tool_groups": tool_groups,
         })
         return core.to_json({
             "ok": True, "job_id": job_id, "status": "running",
