@@ -325,7 +325,12 @@ def check_job(job_id: str, full: bool = False) -> str:
         "job_path": str(_job_path(job_id)),
         "progress": _progress_tail(job_id),
         "delegation_status": record.get("delegation_status"),
-        "coverage": record.get("coverage"),
+        # Bounded, unlike the record on disk: hoisting coverage past the head stub is the point,
+        # but a map_reduce coverage carries a gap path per unexamined file, so verbatim it would
+        # smuggle back the unbounded payload the stub exists to keep out of a cheap poll. The
+        # count, the summary and the first few signals are what a caller acts on; the full list
+        # is in the job record at job_path.
+        "coverage": completeness.compact_coverage(record.get("coverage")),
     }
     if record.get("error"):
         out["error"] = record["error"]

@@ -70,6 +70,10 @@ _SKIPPED_KEY_RE = re.compile(r"^(files_skipped|skipped_)")
 # otherwise flood the MCP caller with the very noise this feature exists to summarize.
 _MAX_SIGNALS = 20
 
+# How many signals the one-line summary names before it collapses the rest into "+N more", and
+# the default bound compact_coverage applies. A summary a caller has to scroll is not a summary.
+_SUMMARY_SIGNALS = 2
+
 
 def detect_cap_signals(tool_name: str, content: Any) -> list[dict[str, Any]]:
     """Inspect one raw tool result and report every cap/truncation signal it advertises.
@@ -274,15 +278,123 @@ def envelope(
     shown = signals[:_MAX_SIGNALS]
     if len(signals) > _MAX_SIGNALS:
         shown.append({"reason": "signals_truncated", "total": len(signals)})
+    gaps = list(gaps or [])
+    status = compute_status(ok, signals)
     return {
-        "status": compute_status(ok, signals),
+        "status": status,
         "coverage": {
             # capped answers "was something lost", so a disclosed-but-lossless signal (a spilled
             # answer) is listed below without raising the alarm.
             "capped": bool(lossy_signals(signals)),
+            "summary": summary_line(status, signals, covered, total, gaps),
             "signals": shown,
             "covered": covered,
             "total": total,
-            "gaps": list(gaps or []),
+            "gaps": gaps,
         },
     }
+
+
+def summary_line(
+    status: str,
+    signals: list[dict[str, Any]] | None,
+    covered: int | None = None,
+    total: int | None = None,
+    gaps: list[Any] | None = None,
+) -> str:
+    """One prose line saying what, if anything, was missed.
+
+    Everything else in ``coverage`` is machine-shaped: bare reason slugs and a signal list a
+    reader has to decode. A caller deciding "do I trust this or re-run it" should not have to.
+    This is built by the same deterministic layer as the rest of the envelope - it is a
+    rendering of the signals, never an extra claim - and it follows the convention the tools
+    already use for the same job ("LISTING TRUNCATED: 900 matches, 50 returned").
+    """
+    signals = list(signals or [])
+    parts: list[str] = []
+
+    if total is not None:
+        seen = covered if covered is not None else "?"
+        parts.append(f"{seen} of {total} examined")
+    if gaps:
+        parts.append(f"{len(gaps)} unexamined")
+
+    lossy = lossy_signals(signals)
+    for sig in lossy[:_SUMMARY_SIGNALS]:
+        tool = sig.get("tool") or "?"
+        reason = sig.get("reason") or "capped"
+        got, want = sig.get("returned"), sig.get("total")
+        if isinstance(got, int) and isinstance(want, int):
+            parts.append(f"{tool} {reason} ({got} of {want})")
+        else:
+            parts.append(f"{tool} {reason}")
+    if len(lossy) > _SUMMARY_SIGNALS:
+        parts.append(f"+{len(lossy) - _SUMMARY_SIGNALS} more")
+
+    # Worth one clause even though nothing was lost: a caller that sees "partial" nowhere but
+    # finds result_path set should not have to wonder whether it missed something.
+    disclosed = len(signals) - len(lossy)
+    if disclosed and not lossy:
+        parts.append(f"{disclosed} disclosed, nothing lost")
+
+    return f"{status}: {'; '.join(parts)}" if parts else status
+
+
+def compact_coverage(coverage: Any, max_signals: int = _SUMMARY_SIGNALS) -> Any:
+    """A bounded copy of a coverage dict, for callers that are themselves size-bounded.
+
+    ``check_job`` hoists coverage OUT of the result so it stays readable when the result is
+    replaced by a head stub - which is right, but a map_reduce coverage carries up to 200 gap
+    paths, so hoisting it verbatim reintroduces exactly the unbounded payload the head stub
+    exists to prevent. The gap LIST is the part that scales with the corpus, so it goes; the
+    count and the summary line, which are what a caller acts on, stay.
+    """
+    if not isinstance(coverage, dict):
+        return coverage
+    out = dict(coverage)
+    gaps = out.get("gaps")
+    if isinstance(gaps, list):
+        out["gaps_total"] = len(gaps)
+        out["gaps"] = gaps[:max_signals]
+        if len(gaps) > max_signals:
+            out["gaps_note"] = "truncated; the full list is in the job record at job_path"
+    signals = out.get("signals")
+    if isinstance(signals, list) and len(signals) > max_signals:
+        out["signals"] = signals[:max_signals]
+        out["signals_note"] = f"{len(signals)} signals; showing {max_signals}"
+    return out
+
+
+def signals_from_history(entries: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Re-derive cap signals from a RESTORED sub-agent history.
+
+    Without this, resume launders every cap the original run hit: the restored history still
+    carries the capped tool results, the model still answers from them, but the recorder was
+    born empty with the new runtime - so a resumed run reports "complete" over exactly the
+    truncated evidence its predecessor was honest about.
+
+    The serialized ToolMessage keeps BOTH views (``content`` is what the model saw,
+    ``artifact.full_content`` the raw result), so this reads the same two things the live
+    recorder does, including the harness's own compaction flag.
+    """
+    out: list[dict[str, Any]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("type") != "tool":
+            continue
+        name = str(entry.get("name") or "unknown")
+        artifact = entry.get("artifact") if isinstance(entry.get("artifact"), dict) else {}
+        raw = artifact.get("full_content", entry.get("content"))
+        try:
+            found = detect_cap_signals(name, raw)
+            if artifact.get("model_content_compacted"):
+                found = found + [{
+                    "tool": name,
+                    "reason": "model_view_compacted",
+                    "returned": None,
+                    "total": None,
+                }]
+        except Exception:
+            continue  # re-reading history must never be able to break a resume
+        for sig in found:
+            out.append({**sig, "restored": True})
+    return out

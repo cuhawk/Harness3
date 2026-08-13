@@ -78,7 +78,13 @@ _CITATION_RE = re.compile(
     # which would otherwise verify a path the model never wrote.
     r"(?<![\w.+@$\\/:])"
     r"(?P<path>"
-    r"(?:[A-Za-z]:[\\/])?"                          # optional Windows drive prefix
+    # Absolute forms: a Windows drive, or a POSIX root. Without the "/" branch the path group
+    # cannot start with a separator, so on a POSIX host - where every absolute citation looks
+    # like /srv/ws/app.py:12 - NO absolute citation was a candidate at all, and an answer whose
+    # references were all absolute counted zero and failed citation_min. A URL cannot sneak in
+    # this way: the boundary lookbehind above rejects a match whose preceding character is a
+    # word char or a separator, which is every "/" inside "https://host/path".
+    r"(?:[A-Za-z]:[\\/]|/)?"
     r"(?:[\w.\-+@$]+[\\/])*"                        # optional directory segments, / or \
     r"[\w\-+@$]+(?:\.[\w\-+@$]+)*"                  # stem, may itself contain dots
     r"\.(?P<ext>[A-Za-z0-9_]{1,10})"                # an extension is mandatory
@@ -96,6 +102,10 @@ _CITATION_RE = re.compile(
 # to tell "api.staging.corp:8443" or "org.slf4j.Logger:5" from an invented bare filename, and
 # guessing wrong in the rejecting direction burns the whole retry ladder on a correct answer.
 _TLD_LIKE = {"com", "net", "org", "io", "dev", "app", "co", "uk", "ai", "gov", "edu", "sh", "me"}
+
+# A Windows drive, a UNC/rooted backslash, or a POSIX root. Used only to decide whether an
+# out-of-workspace path is unverifiable (ignore) or an escape attempt (reject).
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/])")
 
 # Counting the lines of a huge file to check one citation is not worth the stall; over this
 # size the citation is accepted unverified (see _citation_line_count).
@@ -203,6 +213,13 @@ def _citation_targets(path: str, cache: dict[str, Any]) -> tuple[list[Path], str
         try:
             rp = core.resolve_path(path)
         except PermissionError:
+            # An ABSOLUTE path outside the workspace is unverifiable, not fabricated - it is how
+            # an agent cites a file it read over ssh_run, or one on another root - so it falls
+            # under the same "can't tell, so ignore" rule as a bare token. A RELATIVE path that
+            # escapes ("../../etc/passwd.txt") is a different animal: it is anchored to the
+            # workspace by construction and climbing out of it is unambiguous, so it still fails.
+            if _ABSOLUTE_PATH_RE.match(path):
+                return [], ""
             return [], "escapes the workspace"
         except Exception as exc:
             return [], f"is not a usable path ({exc})"
@@ -666,6 +683,11 @@ def _run_subagent_task(
     # under-covered the task, and the runtime is rebuilt from scratch after any attempt that
     # raised - so the signals have to be pulled out per attempt, not read once at the end.
     run_signals: list[dict[str, Any]] = []
+    # A resume inherits its predecessor's caps. Seeded ONCE here rather than inside
+    # runtime_factory, which is re-entered whenever an attempt raises and the runtime is rebuilt
+    # - seeding there would re-add the same signals on every rebuild and inflate the count.
+    if restore_history:
+        run_signals.extend(completeness.signals_from_history(restore_history))
     final_text = ""
     feedback = ""
 
