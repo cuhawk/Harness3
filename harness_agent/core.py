@@ -47,6 +47,12 @@ MODEL_TOOL_RESULT_BYTES = int(os.environ.get("MODEL_TOOL_RESULT_BYTES", "12000")
 
 DEFAULT_TIMEOUT = int(os.environ.get("DEFAULT_TIMEOUT", "60"))
 MAX_TIMEOUT = int(os.environ.get("MAX_TIMEOUT", "900"))
+# Client-side HTTP timeout/retries for the LLM call itself (agent_runtime._build_llm), as
+# opposed to the two above, which bound *tool* execution. Was hardcoded to 120/2, which made
+# a router-side `timeout:` larger than 120 dead letter: a slow reasoning model aborted
+# client-side at 120s and was re-billed on each retry. Defaults preserve the old behaviour.
+LLM_TIMEOUT = int(os.environ.get("HARNESS_LLM_TIMEOUT", "120"))
+LLM_MAX_RETRIES = int(os.environ.get("HARNESS_LLM_MAX_RETRIES", "2"))
 RECURSION_LIMIT = int(os.environ.get("RECURSION_LIMIT", "100"))
 
 ALLOW_UNSAFE_COMMANDS = os.environ.get("ALLOW_UNSAFE_COMMANDS", "0") == "1"

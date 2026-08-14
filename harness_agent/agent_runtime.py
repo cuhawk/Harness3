@@ -271,8 +271,8 @@ class AgentRuntime:
             base_url=core.LITELLM_BASE_URL,
             api_key=core.LITELLM_API_KEY,
             temperature=temperature,
-            timeout=120,
-            max_retries=2,
+            timeout=core.LLM_TIMEOUT,
+            max_retries=core.LLM_MAX_RETRIES,
         )
         return llm.bind_tools(tools)
 
