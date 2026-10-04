@@ -1,4 +1,4 @@
-$env:LITELLM_BASE_URL = "http://localhost:4000/v1"
+$env:LITELLM_BASE_URL = "http://127.0.0.1:8462/v1" # 8462 - qwen, 8097 - ds
 $env:LITELLM_API_KEY = "sk-master-change-me"
-$env:MODEL = "mistral-large"
+$env:MODEL = "deepseek-flash"
 python "C:\Users\soura\Documents\Harness\main.py" --workspace "C:\Users\soura"

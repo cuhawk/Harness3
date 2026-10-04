@@ -59,12 +59,57 @@ ALLOW_UNSAFE_COMMANDS = os.environ.get("ALLOW_UNSAFE_COMMANDS", "0") == "1"
 ALLOW_GIT_DESTRUCTIVE = os.environ.get("ALLOW_GIT_DESTRUCTIVE", "0") == "1"
 ALLOW_DELETE = os.environ.get("ALLOW_DELETE", "1") == "1"
 
-# Runtime-toggleable via /thinking and /stream (cli.py mutates these directly as
-# core.SHOW_THINKING / core.STREAM_RESPONSES - same "read through core.X" pattern as the
-# workspace-derived paths, so a toggle takes effect on the very next turn everywhere that
-# checks it, with no plumbing needed through intermediate call sites).
+# Runtime-toggleable via /thinking, /stream and /usage (cli.py mutates these directly as
+# core.SHOW_THINKING / core.STREAM_RESPONSES / core.SHOW_USAGE - same "read through core.X"
+# pattern as the workspace-derived paths, so a toggle takes effect on the very next turn
+# everywhere that checks it, with no plumbing needed through intermediate call sites).
 SHOW_THINKING = os.environ.get("SHOW_THINKING", "1") != "0"
 STREAM_RESPONSES = os.environ.get("STREAM_RESPONSES", "0") != "0"
+# Per-turn token/speed footer under each reply (see usage.py and cli.handle_turn).
+SHOW_USAGE = os.environ.get("SHOW_USAGE", "1") != "0"
+# Speak replies aloud / take turns from the microphone (see voice.py). Same live-toggle
+# contract as the three above - /voice mutates these as core.VOICE_IN / core.VOICE_OUT.
+# Off by default: both pull in optional packages and cost a few seconds of model load on
+# first use, so a harness without them must behave exactly as it did before.
+VOICE_IN = os.environ.get("VOICE_IN", "0") != "0"
+VOICE_OUT = os.environ.get("VOICE_OUT", "0") != "0"
+# small.en is the smallest model that survives security jargon - base.en and distil-small.en
+# both score worse, and tiny.en renders "unsafe eval" as "unsafe a valve". See voice.py.
+VOICE_STT_MODEL = os.environ.get("VOICE_STT_MODEL", "small.en")
+VOICE_TTS_VOICE = os.environ.get("VOICE_TTS_VOICE", "af_heart")
+# Short emotional cues pre-rendered by Chatterbox and played in front of a Kokoro reply.
+# Kokoro has no emotion axis at all (measured: 13Hz of pitch movement across every mood
+# treatment, against 50-100Hz+ for real emotional speech), and Chatterbox - which does, at
+# 102Hz - runs at 0.24x realtime on CPU and cannot have the GPU while Qwen is loaded. Playing
+# a cached cue is the only way to get affect without paying for it live.
+VOICE_CUES = os.environ.get("VOICE_CUES", "1") != "0"
+# Which synthesiser speaks the BODY of a reply. "kokoro" is the default because it needs no
+# VRAM; "chatterbox" routes every sentence through cbx_server.py on the GPU, which does have
+# an emotion axis, so the mood colours the whole reply instead of just the cue in front of it.
+# That costs 3.7 GB of VRAM and means Qwen has to give up layers to the CPU - see
+# Claude Folder\voice-lab\start-voice-gpu.ps1, which sizes both and sets these.
+VOICE_TTS_ENGINE = os.environ.get("VOICE_TTS", "kokoro").lower()
+VOICE_CBX_URL = os.environ.get("VOICE_CBX_URL", "http://127.0.0.1:8471")
+# Which cloned speaker Chatterbox uses. "default" is the one voice it ships with; anything
+# else is cloned from a reference wav in voice-lab\audio\voices (make_voices.py fills it).
+VOICE_TTS_SPEAKER = os.environ.get("VOICE_TTS_SPEAKER", "default")
+# Let the model choose its own mood per reply instead of matching trigger regexes against the
+# reply text. Off by default here: it only pays off when something is listening, and it puts
+# an extra token at the front of every reply during tool work. See core._mood_tag_block.
+VOICE_MOOD_TAGS = os.environ.get("VOICE_MOOD_TAGS", "0") != "0"
+# Send the operator's message and nothing else - no system prompt. Toggleable live via
+# /bare because a session often wants the full agent for the work and a bare prompt for
+# one quick question, and reconnecting to a local model costs a full re-prefill.
+# See build_system_prompt; pair with HARNESS_TOOL_PROFILE=none to drop the tool schemas too.
+BARE_PROMPT = (os.environ.get("HARNESS_BARE_PROMPT") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+# Ask the backend to report token usage on streamed calls (OpenAI's
+# stream_options={"include_usage": true}, spelled stream_usage=True in langchain-openai).
+# Without it a streamed response carries NO usage at all and the footer falls back to a
+# chars/4 estimate. Both backends here (the LiteLLM proxy and a local llama.cpp server)
+# honour it; the env var is the escape hatch for a backend that rejects stream_options
+# outright, since that would otherwise fail the call itself rather than just the accounting.
+STREAM_USAGE = os.environ.get("HARNESS_STREAM_USAGE", "1") != "0"
 
 # Sub-agent delegation depth guard: a spawned sub-agent can itself spawn
 # sub-agents up to this many levels deep before the tool refuses.
@@ -191,6 +236,17 @@ def load_briefing() -> str:
         return ""
 
 
+def bare_prompt_enabled() -> bool:
+    """True when the operator has asked for their message and nothing else.
+
+    Reads the module flag rather than the env var directly so that /bare on|off works
+    mid-session: cli's _TOGGLE_FLAGS handler does setattr(core, "BARE_PROMPT", ...),
+    and build_system_prompt is called fresh on every reset, so the next /reset picks
+    the change up without a restart.
+    """
+    return bool(BARE_PROMPT)
+
+
 def build_system_prompt() -> str:
     """Build the system prompt against the *current* workspace and capabilities.
 
@@ -199,7 +255,16 @@ def build_system_prompt() -> str:
     capability tiers (memory, RAG, sub-agents, workflows, automations) exist
     without the model having to infer it from tool names alone. Read at call
     time (not import time) for the same reason the briefing is.
+
+    Returns "" under HARNESS_BARE_PROMPT, which drops the system message entirely.
+    Measured against the Qwen3.8 chat template this prompt costs 1451 tokens on
+    EVERY call - real, but small next to the tool schemas (7450 tokens for the core
+    profile, 30241 for full). Bare mode is therefore most useful paired with
+    HARNESS_TOOL_PROFILE=none; see tools_registry.select_tools.
     """
+    if bare_prompt_enabled():
+        return ""
+
     briefing = load_briefing()
     briefing_block = f"""
 ## Standing briefing from the operator (applies to every task in this workspace)
@@ -315,7 +380,34 @@ Workspace root (current):
     re-confirms what you already believe.
 - Surface any disagreement between models or checks to the operator rather than silently
   picking one side.
-""".strip()
+""".strip() + _mood_tag_block()
+
+
+def _mood_tag_block() -> str:
+    """Ask the model to tag its own replies with a mood, but only when something will listen.
+
+    Off unless voice output AND VOICE_MOOD_TAGS are on, because it is dead weight otherwise -
+    and worse than dead weight during tool-calling work, where an extra bracketed token at the
+    front of every reply is a token the agent did not choose to spend.
+
+    It earns its place only for speech: the trigger regexes in voice.py read the REPLY, so
+    they can tell a finding is alarming but never that a tone was asked for. The model sees
+    both halves of the exchange and can.
+    """
+    if not (VOICE_OUT and VOICE_MOOD_TAGS):
+        return ""
+    try:
+        from . import voice
+
+        names = ", ".join(voice.load_moods())
+    except Exception:
+        return ""
+    if not names:
+        return ""
+    return ("\n\nSPOKEN REPLIES: your answers are read aloud. Start each reply with a mood tag "
+            f"in square brackets - for example [mood: done] - chosen from exactly these: "
+            f"{names}. Use [mood: none] when no tone fits. The tag is stripped before speech "
+            "and never read aloud, so write the reply exactly as you otherwise would after it.")
 
 
 # =============================================================================

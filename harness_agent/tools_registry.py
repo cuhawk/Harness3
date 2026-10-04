@@ -382,6 +382,13 @@ def _expand_group_dependencies(group_names: set[str]) -> set[str]:
 
 _FULL_PROFILES = {"full", "all"}
 _CORE_PROFILES = {"core", "lite", "lean"}
+# Bind nothing at all. Measured prompt cost of the tool schemas against the Qwen3.8
+# template: core 7450 tokens, auto on a file-edit task 17775, full 30241 - between 83%
+# and 95% of the whole fixed prompt. On a local llama.cpp backend that prefill is paid
+# in wall clock (a cold 5857-token prompt on DeepSeek measured a 7m54s TTFT), so an
+# operator asking a plain question with no tool use has a real reason to send none.
+# The agent loses all tool access under this profile - it becomes a plain chat model.
+_NONE_PROFILES = {"none", "bare", "off", "chat"}
 _FULL_CATALOG_PHRASES = ("all tools", "full tool", "full tools", "entire tool catalog")
 
 
@@ -520,6 +527,13 @@ def select_tools(
         return ALL_TOOLS
     if requested in _CORE_PROFILES:
         return CORE_TOOLS
+    # Deliberately placed AFTER the pin check above, matching full/core: an explicit
+    # groups=[...] pin comes from code that knows what it needs (subagent.py, the
+    # programmatic fan-outs), and silently stripping its tools because an operator
+    # exported HARNESS_TOOL_PROFILE=none for their own chat would look like a harness
+    # bug rather than a setting.
+    if requested in _NONE_PROFILES:
+        return []
 
     text = str(prompt or "").lower()
     if _contains_any(text, _FULL_CATALOG_PHRASES):

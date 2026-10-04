@@ -421,6 +421,17 @@ class ChatApp(App):
         if terminal_ui.handle_permission_key(event.key):
             event.stop()
             event.prevent_default()
+            return
+
+        # Barge-in. The plain REPL gets this for free (voice.listen silences playback before
+        # it starts recording), but in the Textual UI there is no such moment - a long reply
+        # would otherwise have to be waited out. Escape is safe to overload here: it reaches
+        # App only after the focused ChatInput has declined it.
+        if event.key == "escape":
+            from . import core, voice
+
+            if core.VOICE_OUT:
+                voice.interrupt()
 
     def on_text_selected(self, _event: events.TextSelected) -> None:
         """Mirror terminal copy-on-select for Textual-managed history selections."""

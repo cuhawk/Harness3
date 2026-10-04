@@ -49,6 +49,17 @@ from .terminal_ui import ui_print
 # handle_turn's invoke/invoke_streaming call sites and main()'s first-session bootstrap.
 SESSION_MANAGER = sessions.SessionManager()
 
+# Slash commands that are pure on/off switches over a core.* flag - handled by one pair of
+# blocks in handle_turn rather than a block per flag.
+_TOGGLE_FLAGS = {
+    "/thinking": "SHOW_THINKING",
+    "/stream": "STREAM_RESPONSES",
+    "/usage": "SHOW_USAGE",
+    # Drop the system prompt (1451 tokens on every call). Takes effect on the next
+    # /reset, since the system message is seeded once at history construction.
+    "/bare": "BARE_PROMPT",
+}
+
 # =============================================================================
 # CLI command handlers
 # =============================================================================
@@ -451,6 +462,12 @@ def handle_turn(runtime: AgentRuntime, user_input: str) -> bool:
         ui_print(fs_tools.switch_workspace.invoke({"path": new_path}))
         return False
 
+    if command_input == "/voice" or command_input.startswith("/voice "):
+        from . import voice
+
+        ui_print(voice.handle_command(command_input.removeprefix("/voice")))
+        return False
+
     if command_input == "/tools":
         for t in agent_runtime.TOOLS:
             ui_print(f"- {t.name}: {t.description}")
@@ -545,14 +562,16 @@ def handle_turn(runtime: AgentRuntime, user_input: str) -> bool:
         ui_print(handle_model_test_cli(command_input, runtime))
         return False
 
-    if command_input in {"/thinking", "/stream"}:
-        flag_name = "SHOW_THINKING" if command_input == "/thinking" else "STREAM_RESPONSES"
+    if command_input in _TOGGLE_FLAGS:
+        flag_name = _TOGGLE_FLAGS[command_input]
         ui_print(f"{command_input.lstrip('/')}: {'on' if getattr(core, flag_name) else 'off'}")
+        if command_input == "/usage":
+            ui_print(runtime.session_usage.format_totals())
         return False
 
-    if command_input.startswith("/thinking ") or command_input.startswith("/stream "):
+    if any(command_input.startswith(f"{name} ") for name in _TOGGLE_FLAGS):
         name, _, value = command_input.partition(" ")
-        flag_name = "SHOW_THINKING" if name == "/thinking" else "STREAM_RESPONSES"
+        flag_name = _TOGGLE_FLAGS[name]
         value = value.strip().lower()
         if value not in {"on", "off", "true", "false", "1", "0"}:
             ui_print(f"usage: {name} on|off")
@@ -592,6 +611,13 @@ def handle_turn(runtime: AgentRuntime, user_input: str) -> bool:
                     answer_text = msg.content
                     break
             terminal_ui.render_assistant_message(answer_text, session_id=session.id)
+
+        # Footer under the reply: what the completed turn actually cost and how fast the
+        # model generated it. Rendered from the runtime that RAN the turn (not the caller's
+        # `runtime` argument, which a /session switch mid-turn could have left stale), and
+        # after both branches so streamed and non-streamed turns report identically.
+        if core.SHOW_USAGE:
+            terminal_ui.render_usage(session_runtime.turn_usage.format_line(), session_id=session.id)
     except Exception as e:
         ui_print(f"\nerror> {repr(e)}\n")
 

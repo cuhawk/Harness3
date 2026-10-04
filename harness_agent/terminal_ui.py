@@ -46,6 +46,7 @@ from typing import Any, TYPE_CHECKING
 
 from . import core
 from . import rag
+from . import voice
 
 if TYPE_CHECKING:
     from .tui_app import ChatApp
@@ -304,6 +305,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/model-test", "send a tiny health-check prompt to one or all models"),
     ("/thinking", "show or toggle tool-call/reasoning visibility"),
     ("/stream", "show or toggle live token streaming"),
+    ("/usage", "session token totals; toggle the per-reply tokens/speed footer"),
     ("/exit", "quit"),
 ]
 
@@ -608,6 +610,15 @@ def read_user_input_plain() -> str:
     no encoding safety net, which crashes on PROMPT_INPUT_LABEL's default "❯" under a legacy
     (non-UTF-8) codepage, e.g. when stdout is piped rather than a real console.
     """
+    if core.VOICE_IN:
+        # Speak the turn instead of typing it. Falls through to the keyboard on an empty
+        # transcript (silence, a mis-hear, or voice having just disabled itself because a
+        # dependency is missing) rather than looping on the microphone, so a failing mic can
+        # never lock you out of your own REPL.
+        spoken = voice.listen()
+        if spoken:
+            ui_print(f"{PROMPT_INPUT_LABEL}{spoken}")
+            return normalize_prompt_input(spoken)
     ui_print(PROMPT_INPUT_LABEL, end="", flush=True)
     return normalize_prompt_input(input())
 
@@ -677,11 +688,17 @@ def build_startup_widget(model_name: str, session_name: str, shells: dict[str, s
 
     thinking = "on" if core.SHOW_THINKING else "off"
     stream = "on" if core.STREAM_RESPONSES else "off"
+    usage_flag = "on" if core.SHOW_USAGE else "off"
     body = Group(
         Text.assemble(("harness-agent", "bold cyan"), f"  ·  {session_name}"),
         Text(""),
         Text.assemble(("Ready", "bold"), f" in {core.WORKSPACE}"),
-        Text.assemble(("Model ", "dim"), model_name, ("   Thinking ", "dim"), thinking, ("   Stream ", "dim"), stream),
+        Text.assemble(
+            ("Model ", "dim"), model_name,
+            ("   Thinking ", "dim"), thinking,
+            ("   Stream ", "dim"), stream,
+            ("   Usage ", "dim"), usage_flag,
+        ),
         Text(""),
         Text(
             "/session new for another tab  ·  Tab to autocomplete  ·  /ui for full config  ·  /exit to quit",
@@ -701,6 +718,7 @@ def _startup_status_table(model_name: str, shells: dict[str, str], terminal_ui_v
     status.add_row("Model", model_name)
     status.add_row("Thinking", "on" if core.SHOW_THINKING else "off")
     status.add_row("Stream", "on" if core.STREAM_RESPONSES else "off")
+    status.add_row("Usage footer", "on" if core.SHOW_USAGE else "off")
     status.add_row("LiteLLM proxy", core.LITELLM_BASE_URL)
     status.add_row("Workspace", str(core.WORKSPACE))
     status.add_row("SearXNG", core.SEARXNG_URL)
@@ -730,6 +748,7 @@ def _print_startup_plain(model_name: str, shells: dict[str, str]) -> None:
     ui_print(f"Model: {model_name}")
     ui_print(f"Thinking: {'on' if core.SHOW_THINKING else 'off'}")
     ui_print(f"Stream: {'on' if core.STREAM_RESPONSES else 'off'}")
+    ui_print(f"Usage footer: {'on' if core.SHOW_USAGE else 'off'}")
     ui_print(f"Workspace: {core.WORKSPACE}")
     ui_print(f"SearXNG: {core.SEARXNG_URL}")
     ui_print(f"RAG DB: {core.RAG_DB_PATH}")
@@ -943,6 +962,12 @@ async def _write_thinking_history(text: str, session_id: str | None = None) -> N
 
 
 def render_assistant_message(text: str, session_id: str | None = None) -> None:
+    # Speak before rendering, and before the _dispatch_to_ui early return: this is the one
+    # funnel BOTH front-ends use for a non-streamed reply, so hooking it here covers the
+    # Textual UI and the plain fallback in a single place. voice.say is a no-op when voice
+    # output is off, and hands off to a background thread when it isn't, so neither path
+    # blocks on synthesis.
+    voice.say(text)
     if _dispatch_to_ui(_write_assistant_message_history, text, session_id):
         return
     if not (_RICH_AVAILABLE and USE_RICH):
@@ -972,6 +997,34 @@ async def _write_assistant_message_history(text: str, session_id: str | None = N
         log_tui_error("_write_assistant_message_history", exc)
 
 
+def render_usage(text: str, session_id: str | None = None) -> None:
+    """The per-reply token/speed footer (see usage.Usage.format_line). Dim and unadorned:
+    it prints after every single turn, so it has to read as a margin note under the answer
+    rather than as another block competing with it."""
+    if not text:
+        return
+    if _dispatch_to_ui(_write_usage_history, text, session_id):
+        return
+    if not (_RICH_AVAILABLE and USE_RICH):
+        ui_print(text)
+        return
+    try:
+        _console.print(f"[dim]{text}[/]")
+        _console.print()
+    except Exception:
+        ui_print(text)
+
+
+async def _write_usage_history(text: str, session_id: str | None = None) -> None:
+    from textual.widgets import Static
+    from rich.text import Text
+
+    try:
+        await _mount_history(Static(Text(text, style="dim")), session_id)
+    except Exception as exc:
+        log_tui_error("_write_usage_history", exc)
+
+
 # =============================================================================
 # Streaming
 # =============================================================================
@@ -984,6 +1037,9 @@ def stream_start(session_id: str | None = None) -> None:
     render_assistant_message's styling since the streamed tokens ARE that message,
     just arriving incrementally instead of all at once."""
     _STREAM_TEXT.clear()
+    # Reset the speaker's per-message state so this reply picks its own emotional cue instead
+    # of inheriting the previous one's.
+    voice.begin_stream()
     if _dispatch_to_ui(_tui_stream_start, session_id):
         return
     if _RICH_AVAILABLE and USE_RICH:
@@ -1029,6 +1085,10 @@ def stream_token(text: str, session_id: str | None = None) -> None:
     disambiguate for the live in-progress preview itself.
     """
     _STREAM_TEXT.append(text)
+    # Feed the synthesiser incrementally rather than waiting for stream_end: voice.feed_stream
+    # buffers until a sentence completes, then speaks it, so audio starts about a second into
+    # a reply instead of after the model has finished generating the whole thing.
+    voice.feed_stream(text)
     if _dispatch_to_ui(_tui_stream_token):
         return
     ui_write(text)
@@ -1047,6 +1107,9 @@ def _tui_stream_token() -> None:
 
 
 def stream_end(session_id: str | None = None) -> None:
+    # Speak whatever trailing text never reached a sentence boundary (a reply ending without
+    # terminal punctuation would otherwise be silently dropped).
+    voice.end_stream()
     if _dispatch_to_ui(_tui_stream_end, session_id):
         return
     ui_write("\n\n")
