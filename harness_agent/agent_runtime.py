@@ -33,6 +33,7 @@ from . import permissions
 from . import sessions
 from . import terminal_ui
 from . import tools_registry
+from .tenant_policy import TenantToolAccess
 from . import usage as usage_module
 
 ALL_TOOLS: list[BaseTool] = tools_registry.ALL_TOOLS
@@ -252,8 +253,11 @@ class AgentRuntime:
         session_id: str | None = None,
         pin_tools_to_task: bool = False,
         tool_groups: list[str] | None = None,
+        *,
+        tenant_access: TenantToolAccess | None = None,
     ):
         self.model_name = model_name
+        self.tenant_access = tenant_access
         # Delegated runs set this: score tool selection off the ORIGINAL task plus the latest
         # turn, not the latest turn alone. See tools_registry.select_tools_for_messages.
         # Left False for interactive sessions, where following the newest message is correct.
@@ -334,7 +338,9 @@ class AgentRuntime:
             for idx, message in enumerate(messages):
                 if getattr(message, "type", "") == "human" or message.__class__.__name__ == "HumanMessage":
                     last_human_idx = idx
-            if self._tool_selection_cache is not None and self._tool_selection_cache[0] == last_human_idx:
+            if self.tenant_access is not None:
+                selected_tools = list(self.tenant_access.tools.values())
+            elif self._tool_selection_cache is not None and self._tool_selection_cache[0] == last_human_idx:
                 selected_tools = self._tool_selection_cache[1]
             else:
                 selected_tools = tools_registry.select_tools_for_messages(
@@ -426,13 +432,25 @@ class AgentRuntime:
             name = call.get("name")
             args = call.get("args") or {}
             call_id = call.get("id") or "missing-tool-call-id"
-            tool_obj = TOOL_BY_NAME.get(name)
+            access = self.tenant_access
+            tool_obj = (TOOL_BY_NAME if access is None else access.tools).get(name)
             # Only a real tool invocation is evidence. The unknown-tool, hook-block,
             # permission-block and exception envelopes below are synthesised by this node, and
             # scanning them would let an error masquerade as a coverage gap.
             invoked = False
             if tool_obj is None:
                 content = core.to_json({"ok": False, "error": f"Unknown tool: {name}"})
+            elif access is not None:
+                decision = access.authorize(name, args)
+                if not decision["ok"]:
+                    content = core.to_json(decision)
+                else:
+                    try:
+                        content = tool_obj.invoke(args)
+                    except Exception as exc:
+                        content = core.to_json({"ok": False, "tool": name, "error": type(exc).__name__})
+                    else:
+                        invoked = True
             else:
                 pre_result = hooks.run_hooks("PreToolUse", {"tool_name": name, "args": args})
                 if pre_result.get("blocked"):

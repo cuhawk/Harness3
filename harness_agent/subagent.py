@@ -252,7 +252,7 @@ def _citation_targets(path: str, cache: dict[str, Any]) -> tuple[list[Path], str
     """
     if "/" in path or "\\" in path:
         try:
-            rp = core.resolve_path(path)
+            rp = core.resolve_path(path.replace("\\", "/"))
         except PermissionError:
             # An ABSOLUTE path outside the workspace is unverifiable, not fabricated - it is how
             # an agent cites a file it read over ssh_run, or one on another root - so it falls
