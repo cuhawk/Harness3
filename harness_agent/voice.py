@@ -67,9 +67,10 @@ _lock = threading.Lock()
 
 
 def phrasebank_dir() -> Path:
-    return Path(os.environ.get(
-        "VOICE_PHRASEBANK",
-        r"C:\Users\soura\Documents\Claude Folder\voice-lab\audio\phrasebank"))
+    override = os.environ.get("VOICE_PHRASEBANK")
+    if override is not None:
+        return Path(override)
+    return Path.home() / ".harness" / "voice" / "phrasebank"
 
 
 def cues() -> dict[str, dict]:
@@ -107,9 +108,10 @@ def missing_deps() -> list[str]:
 
 
 def tts_model_path() -> Path:
-    return Path(os.environ.get(
-        "VOICE_TTS_MODEL",
-        r"C:\Users\soura\Documents\Claude Folder\voice-lab\models\kokoro-v1.0.onnx"))
+    override = os.environ.get("VOICE_TTS_MODEL")
+    if override is not None:
+        return Path(override)
+    return Path.home() / ".harness" / "voice" / "models" / "kokoro-v1.0.onnx"
 
 
 def tts_voices_path() -> Path:

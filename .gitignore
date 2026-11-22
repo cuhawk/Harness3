@@ -20,4 +20,5 @@ playwright_mcp_instances.json
 
 # --- local machine config, not portable ---
 .codex/
+.claude/
 *.log
