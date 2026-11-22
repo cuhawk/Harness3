@@ -143,13 +143,13 @@ class ToolResultBudgetTests(unittest.TestCase):
     def test_large_json_tool_result_keeps_bounded_entries_preview(self) -> None:
         content = json.dumps({
             "ok": True,
-            "path": "Atlassian",
+            "path": "sample-project",
             "count": 500,
             "truncated": True,
             "entries": [
                 {
-                    "path": f"Atlassian\\item-{i}",
-                    "absolute_path": f"C:\\workspace\\Atlassian\\item-{i}",
+                    "path": f"sample-project\\item-{i}",
+                    "absolute_path": f"C:\\workspace\\sample-project\\item-{i}",
                     "exists": True,
                     "type": "directory",
                     "size_bytes": 4096,
@@ -168,7 +168,7 @@ class ToolResultBudgetTests(unittest.TestCase):
         self.assertLess(len(payload["entries"]), 80)
         self.assertEqual(payload["entries_original_count"], 80)
         self.assertEqual(payload["entries_preview_count"], len(payload["entries"]))
-        self.assertEqual(payload["entries"][0]["path"], "Atlassian\\item-0")
+        self.assertEqual(payload["entries"][0]["path"], "sample-project\\item-0")
 
 
 if __name__ == "__main__":
